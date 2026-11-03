@@ -304,6 +304,60 @@ async function recognizePriceCrop(worker,canvas) {
   };
 }
 
+// Lightweight on-device logo recognition for compact Instacart cards.
+// Uses the distinctive logo colors/shapes, not OCR's ability to read pictures.
+// Uncertain logos remain unconfirmed; manual store selection stays available.
+function detectStoreLogo(image, orderBox) {
+  if (!orderBox || !Number.isFinite(orderBox.y0)) return null;
+  const w=image.naturalWidth, h=image.naturalHeight;
+  const sx=Math.floor(w*.77), sw=Math.floor(w*.22);
+  const sy=Math.max(0,Math.floor(orderBox.y0-w*.15));
+  const sh=Math.min(Math.floor(w*.19),h-sy);
+  if(sh<=0)return null;
+  const c=document.createElement('canvas');c.width=88;c.height=76;
+  const ctx=c.getContext('2d',{willReadFrequently:true});
+  ctx.drawImage(image,sx,sy,sw,sh,0,0,88,76);
+  const pixels=ctx.getImageData(0,0,88,76).data;
+  let green=0,blue=0,red=0,orange=0,dark=0;
+  let minX=88,maxX=0,minY=76,maxY=0;
+  for(let y=0;y<76;y++)for(let x=0;x<88;x++){
+    const i=(y*88+x)*4,r=pixels[i],g=pixels[i+1],b=pixels[i+2];
+    const isGreen=g>75&&g>r*1.35&&g>b*1.16&&r<160;
+    const isBlue=b>80&&b>r*1.30&&b>g*1.13;
+    const isRed=r>125&&r>g*1.48&&r>b*1.38;
+    const isOrange=r>145&&g>55&&g<r*.85&&b<g*.80;
+    if(isGreen)green++;
+    if(isBlue)blue++;
+    if(isRed)red++;
+    if(isOrange)orange++;
+    if(r<90&&g<110&&b<140)dark++;
+    if(isGreen){minX=Math.min(minX,x);maxX=Math.max(maxX,x);minY=Math.min(minY,y);maxY=Math.max(maxY,y);}
+  }
+  // The Publix logo is a substantial compact green disk with a white P.
+  const gw=maxX-minX+1,gh=maxY-minY+1;
+  if(green>175&&gw>=14&&gh>=14&&gw/gh>.65&&gw/gh<1.5)
+    return {name:'Publix',method:'green circular logo'};
+  // Aldi's blue rectangular mark has a distinctive orange border.
+  if(blue>80&&orange>18&&blue>green*1.5)
+    return {name:'Aldi',method:'blue/orange logo'};
+  // Costco's wordmark contains both red and blue; require both to avoid
+  // confusing it with red promotional badges or the Instacart flame.
+  if(red>45&&blue>35&&red>green*1.5&&blue>green*1.2)
+    return {name:'Costco',method:'red/blue logo'};
+  return null;
+}
+
+function applyLogoRecognition(image, fullData, orders) {
+  const boxes=findOrderBoxes(fullData);
+  // Do not assign logos to unrelated batches if OCR missed an order row.
+  if(boxes.length!==orders.length)return;
+  orders.forEach((order,i)=>{
+    if(order.store!=='Unknown store')return;
+    const detected=detectStoreLogo(image,boxes[i].box);
+    if(detected){order.store=detected.name;order.logoMatch=detected.method;}
+  });
+}
+
 async function recoverPayments(worker,image,fullData,orders) {
   const boxes=findOrderBoxes(fullData);
   const debug=[];
@@ -538,6 +592,7 @@ $('scan').addEventListener('click',async()=>{
 
     const text=result.data.text||'';
     const orders=parseOrders(text);
+    applyLogoRecognition(image,result.data,orders);
 
     $('status').textContent=
       `Found ${orders.length} order row(s). Checking payments...`;
@@ -656,6 +711,7 @@ $('scan').addEventListener('click',async()=>{
       const card=node(cards,'div',undefined,'offer');node(card,'h3','Batch '+(i+1)+' · '+(b.pay===null?'Payment missing':money(b.pay))+' · '+b.store);
       node(card,'p',(b.items??'?')+' total items ('+(b.units??'?')+' units) · '+b.deliveries+' deliveries · '+b.shopOnly+' Shop Only · '+(b.miles??'?')+' delivery miles');
       if(b.shopOnly)node(card,'p','Shop & Deliver: '+(b.deliveryItems??'?')+' items · Shop Only: '+(b.shopOnlyItems??'?')+' items','muted small');
+      if(b.logoMatch)node(card,'p','Store identified from '+b.logoMatch+' · please verify logo','muted small');
       const address=cleanAddress(b.address);if(address)node(card,'p','Screenshot pickup address: '+address,'muted small');
       const missing=[];if(b.pay===null)missing.push('payment');if(b.items===null)missing.push('items');if(b.miles===null)missing.push('mileage');if(b.store==='Unknown store')missing.push('store');
       if(missing.length){node(card,'p','NEEDS DETAILS: '+missing.join(', ')+'. No TAKE/SKIP.','warn');return;}
