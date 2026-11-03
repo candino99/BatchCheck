@@ -1050,6 +1050,138 @@ $('scan').addEventListener('click',async()=>{
 })();
 </script>
 
+<script>
+/* BatchCheck GPS add-on. Keeps existing OCR unchanged. */
+(() => {
+  const names=['Publix','The Fresh Market','Walgreens','Bravo','Aldi','Sprouts','Costco',"Sam's Club",'Target','H Mart','Walmart','Winn-Dixie','Whole Foods'];
+  let position=null, lastOffers=null, version=0;
+  const $id=id=>document.getElementById(id);
+  const css=document.createElement('style');
+  css.textContent=`#preview{max-height:120px;width:auto;max-width:100%;display:block;margin:8px auto}#preview[hidden]{display:none}.gpsbox{background:#0b172c;border:1px solid #425572;border-radius:12px;padding:12px;margin-top:12px}.gpsbox select,.gpsbox button{display:block;width:100%;padding:12px;margin:8px 0;font:inherit}.gpsbox select{background:#182842;color:white;border:1px solid #64748b;border-radius:9px}.gpsbox [hidden]{display:none!important}.gpsverdict{font-size:22px;font-weight:800}.gpsbox .muted{white-space:pre-line}`;
+  document.head.append(css);
+  const status=document.createElement('p');status.className='muted small';status.textContent='📍 Waiting for phone GPS…';
+  $id('file').before(status);
+  const oldDrive=$id('drive');if(oldDrive)oldDrive.closest('label').hidden=true;
+  const el=(p,t,s,cls)=>{const e=document.createElement(t);if(s!==undefined)e.textContent=s;if(cls)e.className=cls;p.append(e);return e;};
+  const dist=(a,b,c,d)=>{const r=x=>x*Math.PI/180,h=Math.sin(r(c-a)/2)**2+Math.cos(r(a))*Math.cos(r(c))*Math.sin(r(d-b)/2)**2;return 3958.76*2*Math.asin(Math.min(1,Math.sqrt(h)));};
+  const good=p=>Number.isFinite(p.lat)&&Number.isFinite(p.lon);
+  const wait=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+  if(navigator.geolocation){navigator.geolocation.watchPosition(p=>{
+    const prior=position;
+    position={lat:p.coords.latitude,lon:p.coords.longitude,accuracy:p.coords.accuracy};
+    status.textContent='📍 GPS connected · accuracy approximately '+Math.round(position.accuracy)+' m';
+    if(!prior&&lastOffers)show(lastOffers);
+  },e=>{status.textContent='⚠ GPS unavailable: '+e.message;},{enableHighAccuracy:true,maximumAge:0,timeout:20000});}
+  else status.textContent='⚠ Location unavailable in this browser';
 
+  async function lookup(address,loc){
+    if(!/\b\d{2,6}\s+\S+/.test(address||''))return null;
+    const number=address.match(/\b\d{2,6}\b/)[0];
+    const queries=[address+', Florida, USA',address];
+    for(const q of queries){
+      try{
+        const url='https://nominatim.openstreetmap.org/search?format=json&addressdetails=1&limit=8&q='+encodeURIComponent(q);
+        const response=await fetch(url);if(!response.ok)continue;
+        const data=await response.json();
+        const matches=data.map(p=>({name:p.display_name,lat:+p.lat,lon:+p.lon,house:String(p.address?.house_number||''),source:'screenshot'}))
+          .filter(good).filter(p=>p.house===number||(!p.house&&new RegExp('(^|\\D)'+number+'(\\D|$)').test(p.name)))
+          .map(p=>({...p,distance:dist(loc.lat,loc.lon,p.lat,p.lon)}))
+          .filter(p=>p.distance<=100).sort((a,b)=>a.distance-b.distance);
+        if(matches.length)return matches[0];
+      }catch(e){console.warn('Screenshot address lookup:',e);}
+      await wait(1100);
+    }
+    return null;
+  }
+  async function alternatives(brand,loc){
+    if(!brand)return [];
+    const escaped=brand.replace(/[.*+?^${}()|[\]\\]/g,'\\$&');
+    const q='[out:json][timeout:18];(nwr["name"~"'+escaped+'",i]["shop"](around:26000,'+loc.lat+','+loc.lon+'););out center 80;';
+    const controller=new AbortController(),timer=setTimeout(()=>controller.abort(),20000);
+    try{
+      const r=await fetch('https://overpass.kumi.systems/api/interpreter',{method:'POST',body:new URLSearchParams({data:q}),signal:controller.signal});
+      if(!r.ok)return [];
+      const data=await r.json(),seen=new Set();
+      return (data.elements||[]).map(x=>({name:[x.tags?.name,[x.tags?.['addr:housenumber'],x.tags?.['addr:street'],x.tags?.['addr:city']].filter(Boolean).join(' ')].filter(Boolean).join(' — '),lat:+(x.lat??x.center?.lat),lon:+(x.lon??x.center?.lon),source:'alternative'}))
+        .filter(good).map(p=>({...p,distance:dist(loc.lat,loc.lon,p.lat,p.lon)}))
+        .filter(p=>p.distance<=16.2).sort((a,b)=>a.distance-b.distance)
+        .filter(p=>{const key=p.lat.toFixed(4)+','+p.lon.toFixed(4);if(seen.has(key))return false;seen.add(key);return true;}).slice(0,20);
+    }catch(e){console.warn('Alternative branch lookup:',e);return [];}finally{clearTimeout(timer);}
+  }
+  async function route(place,loc){
+    const url='https://router.project-osrm.org/route/v1/driving/'+loc.lon+','+loc.lat+';'+place.lon+','+place.lat+'?overview=false';
+    const r=await fetch(url);if(!r.ok)throw Error('Road estimate unavailable');
+    const data=await r.json();if(data.code!=='Ok'||!data.routes?.length)throw Error('No driving route found');
+    return {minutes:Math.ceil(data.routes[0].duration/60),miles:data.routes[0].distance/1609.344};
+  }
+  function estimate(b,drive,brand){
+    const m=mult(brand),fast=drive+b.items*40/60*m+(b.items?10:0)+b.shopOnly*5+b.miles*2+b.deliveries*5;
+    const slow=drive+b.items*55/60*m+(b.items?20:0)+b.shopOnly*5+b.miles*4+b.deliveries*10;
+    if(fast<=0||slow<=0)return null;
+    const low=b.pay*60/slow,high=b.pay*60/fast;
+    return {fast,slow,low,high,mid:(low+high)/2};
+  }
+  show=function(offers){
+    lastOffers=offers;const run=++version,cards=$id('cards');$id('results').hidden=false;cards.replaceChildren();
+    if(!offers.length){el(cards,'p','No batches recognized. See extracted text.','warn');return;}
+    offers.forEach((b,i)=>{
+      const card=el(cards,'div',undefined,'offer');
+      el(card,'h3','Batch '+(i+1)+' · '+(b.pay===null?'Payment missing':money(b.pay))+' · '+b.store);
+      el(card,'p',(b.items??'?')+' items · '+b.deliveries+' deliveries · '+b.shopOnly+' Shop Only · '+(b.miles??'?')+' delivery miles');
+      if(b.address)el(card,'p','Screenshot pickup address: '+b.address,'muted small');
+      const missing=[];if(b.pay===null)missing.push('payment');if(b.items===null)missing.push('items');if(b.miles===null)missing.push('mileage');
+      if(missing.length){el(card,'p','NEEDS DETAILS: '+missing.join(', ')+'. No TAKE/SKIP.','warn');return;}
+      const box=el(card,'div',undefined,'gpsbox');
+      const brand=el(box,'select');el(brand,'option','Select store brand').value='';
+      names.forEach(n=>el(brand,'option',n).value=n);
+      brand.value=names.find(n=>n.toLowerCase()===String(b.store).toLowerCase())||'';
+      const choices=el(box,'select');choices.hidden=true;
+      const verdict=el(box,'p','Waiting for GPS…','gpsverdict');
+      const details=el(box,'p','','muted');
+      const notice=el(box,'p','','gps-note');
+      const refresh=el(box,'button','Refresh locations');refresh.type='button';
+      let places=[],request=0,selection=0;
+      async function calculate(){
+        const ticket=++selection,place=places[Number(choices.value)],loc=position&&{...position};
+        if(!place||!loc)return;
+        verdict.textContent='Calculating road drive…';verdict.className='gpsverdict';
+        try{
+          const trip=await route(place,loc);
+          if(ticket!==selection||run!==version)return;
+          const result=estimate(b,trip.minutes,brand.value||b.store);
+          if(!result)throw Error('Invalid batch numbers');
+          verdict.textContent=(result.mid>=20?'TAKE':'SKIP')+' · '+money(result.mid)+'/hr midpoint';
+          verdict.className='gpsverdict '+(result.mid>=20?'take':'skip');
+          details.textContent='GPS drive to store: '+trip.minutes+' min ('+trip.miles.toFixed(1)+' road miles)\nHourly range: '+money(result.low)+'–'+money(result.high)+'/hr\nTotal time: '+Math.round(result.fast)+'–'+Math.round(result.slow)+' min';
+          notice.textContent=(place.source==='screenshot'?'Using screenshot pickup address. ':'PROVISIONAL: nearest matching branch; verify pickup address. ')+'Road estimate excludes live traffic.';
+        }catch(e){if(ticket!==selection)return;verdict.textContent='Cannot calculate: '+e.message;details.textContent='';}
+      }
+      async function search(){
+        const ticket=++request;selection++;places=[];choices.hidden=true;details.textContent='';
+        if(!position){verdict.textContent='Waiting for phone GPS permission…';return;}
+        const loc={...position};verdict.textContent='Finding screenshot pickup address…';
+        const exact=await lookup(b.address,loc);
+        if(ticket!==request||run!==version)return;
+        if(exact){places=[exact];draw();await calculate();}
+        else verdict.textContent='Screenshot address not located; finding nearby branches…';
+        const nearby=await alternatives(brand.value,loc);
+        if(ticket!==request||run!==version)return;
+        places=exact?[exact,...nearby.filter(p=>dist(p.lat,p.lon,exact.lat,exact.lon)>.15)]:nearby;
+        if(!places.length){verdict.textContent='No store location found. No TAKE/SKIP.';choices.hidden=true;return;}
+        draw();if(!exact)await calculate();
+      }
+      function draw(){
+        choices.replaceChildren();places.forEach((p,j)=>{const label=(p.source==='screenshot'?'📍 SCREENSHOT PICKUP · ':'Alternative · ')+p.name+' · '+p.distance.toFixed(1)+' mi away';el(choices,'option',label).value=String(j);});
+        choices.hidden=false;choices.value='0';
+      }
+      choices.addEventListener('change',calculate);
+      brand.addEventListener('change',search);
+      refresh.addEventListener('click',search);
+      if(position)search();
+    });
+  };
+})();
+</script>
+  
 </body>
 </html>
