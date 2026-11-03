@@ -100,6 +100,7 @@ const stores = [
   [/741\s+s\s+orlando/i,'Publix'],
   [/11055\s+daryl\s+carter/i,'Publix'],
   [/1500\s+(?:north|n)\s+mills/i,'The Fresh Market'],
+  [/1501\s+meeting\s+(?:pl|place)/i,'Publix'],
   [/2015\s+edgewater\s+(?:dr|drive)/i,'Publix'],
   [/2701\s+n\s+hiawassee/i,'Bravo']
 ];
@@ -158,56 +159,62 @@ function identifyStore(address, text) {
 }
 
 function parseOrders(text) {
-  const lines = String(text).replace(/\r/g,'\n').split('\n')
-    .map(s=>s.trim()).filter(Boolean);
+  const lines=String(text).replace(/\r/g,'\n').split('\n').map(s=>s.trim()).filter(Boolean);
   const starts=[];
   for(let i=0;i<lines.length;i++) if(orderRe.test(lines[i])) starts.push(i);
   const rows=[];
   for(let k=0;k<starts.length;k++) {
-    const start=starts[k], end=k+1<starts.length?starts[k+1]:lines.length;
+    const start=starts[k],end=k+1<starts.length?starts[k+1]:lines.length;
     const section=lines.slice(start,end);
-    const order=section[0].match(orderRe);
-    if(!order)continue;
-    const items=section.find(x=>itemRe.test(x))?.match(itemRe);
+    const header=section[0];
+    const matches=[...header.matchAll(/(\d+)\s*(shop\s*(?:&|and|\+)\s*deliver|shop\s*only|delivery\s*only)/gi)];
+    if(!matches.length)continue;
+    // Instacart displays mixed orders side by side on ONE line, followed
+    // by separate item counts on ONE line (or occasionally separate lines).
+    const counts=[...section.join(' ').matchAll(/(\d+)\s*items?\s*(?:\(\s*(\d+)\s*units?\s*\))?/gi)];
+    const itemCounts=counts.map(x=>Number(x[1]));
+    const unitCounts=counts.map(x=>x[2]?Number(x[2]):null);
     const miles=section.find(x=>milesRe.test(x))?.match(milesRe);
-    const address=(section.find(x=>/\d{2,}\s+.+(?:rd|road|ave|avenue|pkwy|parkway|blvd|street|dr|drive)/i.test(x))||'')
+    const address=(section.find(x=>/\d{2,}\s+.+(?:rd|road|ave|avenue|pkwy|parkway|blvd|street|dr|drive|pl|place)\b/i.test(x))||'')
       .replace(/\s+\d+(?:[.,]\d+)?\s*(?:mi|miles?)\b.*$/i,'').trim();
-    const count=Number(order[1]);
-    const isShopOnly=/shop\s*only/i.test(order[2]);
-    const preceding=lines.slice(Math.max(0,start-3),start);
     let pay=null;
-    for(let j=preceding.length-1;j>=0;j--){
-      const candidate=getPrice(preceding[j]);
+    for(let j=start-1;j>=Math.max(0,start-4);j--){
+      const candidate=getPrice(lines[j]);
       if(candidate!==null){pay=candidate;break;}
     }
+    const deliveries=matches.reduce((n,x)=>n+(/shop\s*only/i.test(x[2])?0:Number(x[1])),0);
+    const shopOnly=matches.reduce((n,x)=>n+(/shop\s*only/i.test(x[2])?Number(x[1]):0),0);
+    const mixed=deliveries>0&&shopOnly>0;
+    const allItems=counts.length>=matches.length && matches.length>1
+      ?itemCounts.slice(0,matches.length).reduce((a,b)=>a+b,0)
+      :counts.length===1&&matches.length===1?itemCounts[0]:null;
+    const allUnits=allItems===null?null:
+      unitCounts.slice(0,matches.length).every(x=>x!==null)
+      ?unitCounts.slice(0,matches.length).reduce((a,b)=>a+b,0):null;
     rows.push({pay,store:identifyStore(address,section.join(' ')),
-      items:items?Number(items[1]):null,units:items?.[2]?Number(items[2]):null,
+      items:allItems,units:allUnits,
+      deliveryItems:mixed?itemCounts[0]??null:deliveries?allItems:0,
+      shopOnlyItems:mixed?itemCounts[1]??null:shopOnly?allItems:0,
       miles:miles?Number(miles[1].replace(',','.')):null,
-      deliveries:isShopOnly?0:count,shopOnly:isShopOnly?count:0,
-      address,orderText:section[0],sourceIndex:start,
-      kind:isShopOnly?'shopOnly':'delivery'});
+      deliveries,shopOnly,address,orderText:header,sourceIndex:start,
+      kind:mixed?'mixed':shopOnly?'shopOnly':'delivery'});
   }
-  // Instacart sometimes prints Shop & Deliver and Shop Only as two rows
-  // under one payment. Merge only adjacent complementary rows without
-  // a second payment; never merge two separately priced offers.
   const found=[];
   for(const row of rows){
     const prev=found[found.length-1];
-    const compatible=prev && prev.kind!==row.kind && row.pay===null &&
-      row.sourceIndex-prev.sourceIndex<=10 &&
-      (!prev.address||!row.address||prev.address.toLowerCase()===row.address.toLowerCase()) &&
-      (prev.store==='Unknown store'||row.store==='Unknown store'||prev.store.toLowerCase()===row.store.toLowerCase());
+    const compatible=prev&&prev.kind!==row.kind&&prev.kind!=='mixed'&&row.kind!=='mixed'&&row.pay===null&&
+      row.sourceIndex-prev.sourceIndex<=10&&
+      (!prev.address||!row.address||prev.address.toLowerCase()===row.address.toLowerCase());
     if(compatible){
       prev.items=prev.items===null||row.items===null?null:prev.items+row.items;
       prev.units=prev.units===null||row.units===null?null:prev.units+row.units;
-      prev.deliveries+=row.deliveries;
-      prev.shopOnly+=row.shopOnly;
-      prev.miles=prev.miles??row.miles;
-      prev.address=prev.address||row.address;
+      prev.deliveryItems=(prev.deliveryItems??0)+(row.deliveryItems??0);
+      prev.shopOnlyItems=(prev.shopOnlyItems??0)+(row.shopOnlyItems??0);
+      prev.deliveries+=row.deliveries;prev.shopOnly+=row.shopOnly;
+      prev.miles=prev.miles??row.miles;prev.address=prev.address||row.address;
       if(prev.store==='Unknown store')prev.store=row.store;
-      prev.orderText+=' + '+row.orderText;
-      prev.kind='mixed';
-    } else found.push({...row});
+      prev.orderText+=' + '+row.orderText;prev.kind='mixed';
+    }else found.push({...row});
   }
   return found;
 }
@@ -646,7 +653,8 @@ $('scan').addEventListener('click',async()=>{
     if(!offers.length){node(cards,'p','No batches recognized. See extracted text.','warn');return;}
     offers.forEach((b,i)=>{
       const card=node(cards,'div',undefined,'offer');node(card,'h3','Batch '+(i+1)+' · '+(b.pay===null?'Payment missing':money(b.pay))+' · '+b.store);
-      node(card,'p',(b.items??'?')+' items · '+b.deliveries+' deliveries · '+b.shopOnly+' Shop Only · '+(b.miles??'?')+' delivery miles');
+      node(card,'p',(b.items??'?')+' total items ('+(b.units??'?')+' units) · '+b.deliveries+' deliveries · '+b.shopOnly+' Shop Only · '+(b.miles??'?')+' delivery miles');
+      if(b.shopOnly)node(card,'p','Shop & Deliver: '+(b.deliveryItems??'?')+' items · Shop Only: '+(b.shopOnlyItems??'?')+' items','muted small');
       const address=cleanAddress(b.address);if(address)node(card,'p','Screenshot pickup address: '+address,'muted small');
       const missing=[];if(b.pay===null)missing.push('payment');if(b.items===null)missing.push('items');if(b.miles===null)missing.push('mileage');if(b.store==='Unknown store')missing.push('store');
       if(missing.length){node(card,'p','NEEDS DETAILS: '+missing.join(', ')+'. No TAKE/SKIP.','warn');return;}
