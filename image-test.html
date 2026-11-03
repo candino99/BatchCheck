@@ -1,9 +1,590 @@
 
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BatchCheck · Image Test</title>
+<style>
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0b1224;color:#f5f8ff;font:16px system-ui,-apple-system,sans-serif}
+main{max-width:720px;margin:auto;padding:24px 18px 60px}
+h1{font-size:30px}
+h2{font-size:21px}
+p,.muted{color:#afbed8;line-height:1.5}
+.panel,.offer{background:#152139;border:1px solid #354563;border-radius:18px;padding:20px;margin:18px 0}
+input,button{font:inherit}
+input[type=file]{display:block;max-width:100%;margin:14px 0}
+button{background:#63daa1;color:#092519;border:0;border-radius:12px;padding:13px 20px;font-weight:700;cursor:pointer}
+button:disabled{opacity:.45}
+img{width:100%;max-height:480px;object-fit:contain;border-radius:10px;background:#0b1224}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0a1427;padding:14px;border-radius:10px;max-height:330px;overflow:auto}
+summary{cursor:pointer}
+strong{color:white}
+.warn{color:#ffcc80}
+.take{color:#76e6ac}
+.skip{color:#ff8b9b}
+.status{font-size:14px}
+.offer h3{margin:0 0 10px}
+label{display:block;margin:12px 0}
+input[type=number]{background:#0b1224;border:1px solid #50607a;color:white;padding:10px;width:90px;border-radius:8px}
+.small{font-size:13px}
+</style>
+</head>
+<body>
+<main>
+
+<h1>BatchCheck <span style="color:#63daa1">Image Test</span></h1>
+
+<p>
+Full-screen screenshot recognition with a second pass for payment amounts.
+No manual cropping required. Images are processed in your browser.
+</p>
+
+<section class="panel">
+<h2>1. Choose an Instacart screenshot</h2>
+
+<input id="file" type="file" accept="image/*">
+
+<img id="preview" hidden alt="Selected screenshot">
+
+<label>
+Assumed drive to store (minutes):
+<input id="drive" type="number" min="0" value="10">
+</label>
+
+<button id="scan" disabled>Read screenshot</button>
+
+<p id="status" class="status" aria-live="polite">
+Select a screenshot to begin.
+</p>
+</section>
+
+<section id="results" class="panel" hidden>
+<h2>2. Recognized batches</h2>
+<div id="cards"></div>
+
+<details>
+<summary>Show extracted text (for troubleshooting)</summary>
+<pre id="raw"></pre>
+</details>
+</section>
+
+<p class="muted">
+Estimates are gross, not guaranteed. Always verify the store,
+payment, item count, mileage, and drive time before accepting.
+Unknown or incomplete offers are not given TAKE/SKIP.
+</p>
+
+</main>
+
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
+<script>
+'use strict';
+
+const $ = id => document.getElementById(id);
+const money = n => '$' + Number(n).toFixed(2);
+
+const mult = name =>
+  /h[ -]?mart/i.test(name) ? 2 :
+  /costco|sam'?s club|target/i.test(name) ? 1.5 :
+  /publix/i.test(name) ? 1 :
+  /aldi|sprouts|fresh market/i.test(name) ? 1.25 :
+  1.25;
+
+const stores = [
+  [/2550\s+n\s+hiawassee/i,'Walgreens'],
+  [/1720\s+e\s+silver\s+star/i,'Publix'],
+  [/741\s+s\s+orlando/i,'Publix'],
+  [/11055\s+daryl\s+carter/i,'Publix'],
+  [/1500\s+(?:north|n)\s+mills/i,'The Fresh Market'],
+  [/2701\s+n\s+hiawassee/i,'Bravo']
+];
+
+const orderRe =
+  /(\d+)\s*(shop\s*(?:&|and|\+)\s*deliver|shop\s*only|delivery\s*only)/i;
+
+const itemRe =
+  /(\d+)\s*items?\s*(?:\(\s*(\d+)\s*units?\s*\))?/i;
+
+const milesRe =
+  /(\d+(?:[.,]\d+)?)\s*(?:mi|miles?)\b/i;
+
+function getPrice(text, allowBare=false) {
+  const clean = String(text)
+    .replace(/[＄]/g,'$')
+    .replace(/[，]/g,',')
+    .replace(/[．]/g,'.');
+
+  const withDollar =
+    clean.match(/\$\s*(\d{1,4})\s*[.,]\s*(\d{2})/);
+
+  if (withDollar) {
+    const value = Number(withDollar[1]+'.'+withDollar[2]);
+    if (value > 0 && value < 1000) return value;
+  }
+
+  if (allowBare) {
+    const lines = clean.split('\n').map(x=>x.trim());
+
+    for (const line of lines) {
+      if (/pts|items|units|mi|deliver|shop/i.test(line)) continue;
+
+      const bare = line.match(
+        /^(?:[$S]\s*)?(\d{1,3})\s*[.,]\s*(\d{2})[¢🔥\s]*$/
+      );
+
+      if (bare) {
+        const value = Number(bare[1]+'.'+bare[2]);
+        if (value >= 1 && value < 1000) return value;
+      }
+    }
+  }
+
+  return null;
+}
+
+function identifyStore(address, text) {
+  const explicit = String(text).match(
+    /the fresh market|fresh market|publix|walgreens|bravo|aldi|sprouts|costco|sam'?s club|target|h[ -]?mart/i
+  );
+
+  return explicit?.[0] ||
+    stores.find(([re])=>re.test(address))?.[1] ||
+    'Unknown store';
+}
+
+function parseOrders(text) {
+  const lines = String(text)
+    .replace(/\r/g,'\n')
+    .split('\n')
+    .map(s=>s.trim())
+    .filter(Boolean);
+
+  const starts = [];
+
+  for (let i=0;i<lines.length;i++) {
+    if (orderRe.test(lines[i])) starts.push(i);
+  }
+
+  const found = [];
+
+  for (let k=0;k<starts.length;k++) {
+    const start = starts[k];
+    const end = k+1<starts.length ? starts[k+1] : lines.length;
+
+    const section = lines.slice(start,end);
+    const order = section[0].match(orderRe);
+
+    if (!order) continue;
+
+    const items = section.find(x=>itemRe.test(x))?.match(itemRe);
+
+    const mileageLine = section.find(x=>milesRe.test(x));
+    const miles = mileageLine?.match(milesRe);
+
+    const address = section.find(x=>
+      /\d{2,}\s+.+(?:rd|road|ave|avenue|pkwy|parkway|blvd|street|dr|drive)/i.test(x)
+    ) || '';
+
+    const count = Number(order[1]);
+    const shopOnly = /shop\s*only/i.test(order[2]) ? count : 0;
+
+    // Look for a payment immediately above this order.
+    // Do not borrow a payment from another batch.
+    const preceding = lines.slice(Math.max(0,start-3),start);
+    let pay = null;
+
+    for (let j=preceding.length-1;j>=0;j--) {
+      const candidate = getPrice(preceding[j]);
+
+      if (candidate !== null) {
+        pay = candidate;
+        break;
+      }
+    }
+
+    found.push({
+      pay,
+      store:identifyStore(address,section.join(' ')),
+      items:items ? Number(items[1]) : null,
+      units:items?.[2] ? Number(items[2]) : null,
+      miles:miles ? Number(miles[1].replace(',','.')) : null,
+      deliveries:shopOnly ? 0 : count,
+      shopOnly,
+      address,
+      orderText:section[0],
+      sourceIndex:start
+    });
+  }
+
+  return found;
+}
+
+function makeCanvas(image,sx,sy,sw,sh,scale=3,threshold=false) {
+  const canvas=document.createElement('canvas');
+
+  sx=Math.max(0,Math.floor(sx));
+  sy=Math.max(0,Math.floor(sy));
+  sw=Math.min(Math.ceil(sw),image.naturalWidth-sx);
+  sh=Math.min(Math.ceil(sh),image.naturalHeight-sy);
+
+  if(sw<=0||sh<=0) return null;
+
+  canvas.width=Math.round(sw*scale);
+  canvas.height=Math.round(sh*scale);
+
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  ctx.fillStyle='#fff';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  ctx.imageSmoothingEnabled=true;
+  ctx.imageSmoothingQuality='high';
+
+  ctx.drawImage(
+    image,sx,sy,sw,sh,
+    0,0,canvas.width,canvas.height
+  );
+
+  if(threshold) {
+    const data=ctx.getImageData(0,0,canvas.width,canvas.height);
+    const pixels=data.data;
+
+    for(let i=0;i<pixels.length;i+=4) {
+      const gray=
+        pixels[i]*0.299+
+        pixels[i+1]*0.587+
+        pixels[i+2]*0.114;
+
+      const v=gray<165 ? 0 : 255;
+      pixels[i]=v;
+      pixels[i+1]=v;
+      pixels[i+2]=v;
+    }
+
+    ctx.putImageData(data,0,0);
+  }
+
+  return canvas;
+}
+
+async function loadImage(file) {
+  const url=URL.createObjectURL(file);
+
+  try {
+    const image=new Image();
+    image.src=url;
+    await image.decode();
+    return image;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function findOrderBoxes(data) {
+  const lines=data.lines||[];
+
+  return lines
+    .filter(line=>orderRe.test(line.text||''))
+    .map(line=>({
+      text:line.text,
+      box:line.bbox
+    }))
+    .filter(x=>x.box&&Number.isFinite(x.box.y0))
+    .sort((a,b)=>a.box.y0-b.box.y0);
+}
+
+async function recognizePriceCrop(worker,canvas) {
+  if(!canvas) return {pay:null,text:''};
+
+  const result=await worker.recognize(canvas);
+  const text=result.data.text||'';
+
+  return {
+    pay:getPrice(text,true),
+    text
+  };
+}
+
+async function recoverPayments(worker,image,fullData,orders) {
+  const boxes=findOrderBoxes(fullData);
+  const debug=[];
+
+  if(!boxes.length) {
+    debug.push('No order positions detected in the first OCR pass.');
+    return debug;
+  }
+
+  const width=image.naturalWidth;
+  const height=image.naturalHeight;
+
+  // Match order rows to OCR boxes in their top-to-bottom order.
+  const count=Math.min(boxes.length,orders.length);
+
+  for(let i=0;i<count;i++) {
+    const order=orders[i];
+    const box=boxes[i].box;
+
+    if(order.pay!==null) continue;
+
+    $('status').textContent=
+      `Reading payment for batch ${i+1} of ${count}...`;
+
+    // The payment is above the "Shop & deliver" line,
+    // on the left side of the same card.
+    // Cropping happens automatically in memory.
+    const cropHeight=Math.max(65,Math.round(width*0.17));
+
+    const sx=Math.round(width*0.025);
+    const sy=Math.max(0,box.y0-cropHeight);
+    const sw=Math.round(width*0.64);
+    const sh=Math.max(1,box.y0-sy);
+
+    let recovered=null;
+
+    for(const threshold of [false,true]) {
+      const crop=makeCanvas(
+        image,sx,sy,sw,sh,3,threshold
+      );
+
+      const attempt=await recognizePriceCrop(worker,crop);
+
+      debug.push(
+        `Batch ${i+1} payment pass (${threshold?'high contrast':'normal'}):\n`+
+        attempt.text
+      );
+
+      if(attempt.pay!==null) {
+        recovered=attempt.pay;
+        break;
+      }
+    }
+
+    order.pay=recovered;
+  }
+
+  return debug;
+}
+
+function addText(parent,tag,value,className='') {
+  const el=document.createElement(tag);
+  el.textContent=value;
+  if(className) el.className=className;
+  parent.append(el);
+  return el;
+}
+
+function show(offers) {
+  $('results').hidden=false;
+  $('cards').replaceChildren();
+
+  if(!offers.length) {
+    addText(
+      $('cards'),'p',
+      'No batch order details recognized. Check the extracted text below.',
+      'warn'
+    );
+    return;
+  }
+
+  for(let i=0;i<offers.length;i++) {
+    const b=offers[i];
+    const div=document.createElement('div');
+    div.className='offer';
+
+    addText(
+      div,'h3',
+      `Batch ${i+1}: ${b.pay===null?'Payment missing':money(b.pay)} · ${b.store}`
+    );
+
+    addText(
+      div,'p',
+      `${b.items??'?'} items · ${b.deliveries} deliveries · `+
+      `${b.shopOnly} Shop Only · ${b.miles??'?'} miles`
+    );
+
+    if(b.address) {
+      addText(div,'p',b.address,'muted small');
+    }
+
+    const missing=[];
+
+    if(b.pay===null) missing.push('payment amount');
+    if(b.items===null) missing.push('item count');
+    if(b.miles===null) missing.push('mileage');
+    if(b.store==='Unknown store') missing.push('store identity');
+
+    if(missing.length) {
+      addText(
+        div,'p',
+        'NEEDS DETAILS: Missing '+missing.join(', ')+
+        '. No TAKE/SKIP recommendation.',
+        'warn'
+      );
+
+      $('cards').append(div);
+      continue;
+    }
+
+    const drive=Number($('drive').value);
+
+    if(!Number.isFinite(drive)||drive<0) {
+      addText(div,'p','NEEDS DETAILS: Invalid drive time.','warn');
+      $('cards').append(div);
+      continue;
+    }
+
+    const m=mult(b.store);
+
+    const fast=
+      drive+
+      b.items*40/60*m+
+      (b.items?10:0)+
+      b.shopOnly*5+
+      b.miles*2+
+      b.deliveries*5;
+
+    const slow=
+      drive+
+      b.items*55/60*m+
+      (b.items?20:0)+
+      b.shopOnly*5+
+      b.miles*4+
+      b.deliveries*10;
+
+    if(fast<=0||slow<=0) {
+      addText(div,'p','NEEDS DETAILS: Invalid time estimate.','warn');
+      $('cards').append(div);
+      continue;
+    }
+
+    const low=b.pay*60/slow;
+    const high=b.pay*60/fast;
+    const midpoint=(low+high)/2;
+    const take=midpoint>=20;
+
+    addText(
+      div,'p',
+      `${take?'TAKE':'SKIP'} · ${money(midpoint)}/hr midpoint · `+
+      `${Math.round(fast)}–${Math.round(slow)} min estimated`,
+      take?'take':'skip'
+    );
+
+    addText(
+      div,'p',
+      `Estimated hourly range: ${money(low)}–${money(high)}/hr`,
+      'muted'
+    );
+
+    addText(
+      div,'p',
+      'Drive time assumed; confirm OCR details before accepting.',
+      'warn'
+    );
+
+    $('cards').append(div);
+  }
+}
+
+$('file').addEventListener('change',()=>{
+  const file=$('file').files[0];
+
+  $('scan').disabled=!file;
+  $('results').hidden=true;
+
+  if(file) {
+    $('preview').src=URL.createObjectURL(file);
+    $('preview').hidden=false;
+    $('status').textContent='Ready to scan '+file.name;
+  }
+});
+
+$('scan').addEventListener('click',async()=>{
+  const file=$('file').files[0];
+  if(!file)return;
+
+  if(!window.Tesseract) {
+    $('status').textContent=
+      'OCR library could not load. Check your internet connection.';
+    return;
+  }
+
+  $('scan').disabled=true;
+  $('results').hidden=true;
+
+  let worker;
+
+  try {
+    $('status').textContent='Loading image recognition...';
+
+    const image=await loadImage(file);
+
+    worker=await Tesseract.createWorker('eng',1,{
+      logger:m=>{
+        if(m.status&&m.status.includes('loading')) {
+          $('status').textContent=
+            m.status+
+            (m.progress?' '+Math.round(m.progress*100)+'%':'');
+        }
+      }
+    });
+
+    $('status').textContent='Reading the full screenshot...';
+
+    // Request positional OCR data so we can locate order rows.
+    const result=await worker.recognize(
+      file,
+      {},
+      {text:true,blocks:true}
+    );
+
+    const text=result.data.text||'';
+    const orders=parseOrders(text);
+
+    $('status').textContent=
+      `Found ${orders.length} order row(s). Checking payments...`;
+
+    const debug=await recoverPayments(
+      worker,image,result.data,orders
+    );
+
+    $('raw').textContent=
+      'FULL SCREEN OCR:\n'+text+
+      '\n\nSECOND-PASS PAYMENT OCR:\n'+
+      debug.join('\n---\n');
+
+    show(orders);
+
+    const complete=orders.filter(b=>
+      b.pay!==null&&
+      b.items!==null&&
+      b.miles!==null&&
+      b.store!=='Unknown store'
+    ).length;
+
+    $('status').textContent=
+      `Finished. ${orders.length} batch(es) found; `+
+      `${complete} complete. Review details below.`;
+
+  } catch(e) {
+    $('status').textContent=
+      'Recognition failed: '+(e?.message||String(e));
+  } finally {
+    if(worker) {
+      await worker.terminate().catch(()=>{});
+    }
+    $('scan').disabled=false;
+  }
+});
+</script>
+  
 <script>
 "use strict";
 
-/* BatchCheck GPS — screenshot address first,
-   nearby alternatives second, automatic TAKE/SKIP. */
+/* BatchCheck GPS-integrated screenshot results.
+   Preserves the existing OCR and payment scanner. */
 
 (() => {
   const brands = [
@@ -13,10 +594,8 @@
     "Walmart", "Winn-Dixie", "Whole Foods"
   ];
 
-  let gps = null;
-  let latestOffers = [];
-  let generation = 0;
-  let activeCards = [];
+  let currentLocation = null;
+  const cache = new Map();
 
   const style = document.createElement("style");
   style.textContent = `
@@ -26,257 +605,139 @@
     }
     #preview[hidden] { display:none; }
     .gps-card {
+      padding:15px; margin:12px 0;
       background:#0d1a30; border:1px solid #405471;
-      border-radius:13px; padding:14px; margin-top:12px;
+      border-radius:13px;
     }
-    .gps-card select,.gps-card button {
-      width:100%; min-height:46px; margin:6px 0;
+    .gps-card select, .gps-card button {
+      width:100%; margin:7px 0; min-height:48px;
       font-size:16px;
     }
     .gps-card select {
       background:#182842; color:white;
-      border:1px solid #60718d;
-      border-radius:9px; padding:10px;
+      border:1px solid #60718d; border-radius:9px;
+      padding:10px;
     }
+    .gps-card button { background:#63daa1; color:#092519; }
     .gps-result {
-      font-size:21px; font-weight:800;
-      margin:12px 0; line-height:1.5;
+      font-size:20px; font-weight:800;
+      line-height:1.5; margin-top:12px;
     }
-    .gps-note {
-      color:#ffcc80; font-size:13px;
-      line-height:1.5;
-    }
-    .gps-card [hidden] { display:none!important; }
+    .gps-note { font-size:13px; color:#ffcc80; }
   `;
   document.head.append(style);
 
   const gpsStatus = document.createElement("p");
   gpsStatus.className = "muted small";
-  gpsStatus.textContent = "📍 Connecting to GPS...";
+  gpsStatus.textContent = "📍 Connecting to phone GPS...";
 
   const fileInput = document.getElementById("file");
-  fileInput.parentElement.insertBefore(gpsStatus, fileInput);
-
-  const oldDrive = document.getElementById("drive");
-  if (oldDrive) oldDrive.closest("label").hidden = true;
-
-  function add(parent, tag, value, className) {
-    const element = document.createElement(tag);
-    if (value !== undefined) element.textContent = value;
-    if (className) element.className = className;
-    parent.append(element);
-    return element;
-  }
-
-  function milesBetween(a, b, c, d) {
-    const rad = n => n * Math.PI / 180;
-    const h =
-      Math.sin(rad(c-a)/2)**2 +
-      Math.cos(rad(a))*Math.cos(rad(c))*
-      Math.sin(rad(d-b)/2)**2;
-    return 3958.8 * 2 * Math.asin(
-      Math.min(1, Math.sqrt(h))
-    );
-  }
-
-  function valid(point) {
-    return Number.isFinite(point.lat) &&
-           Number.isFinite(point.lon);
-  }
-
-  function locationUpdate(position) {
-    const previous = gps;
-
-    gps = {
-      lat: position.coords.latitude,
-      lon: position.coords.longitude,
-      accuracy: position.coords.accuracy,
-      time: position.timestamp
-    };
-
-    gpsStatus.textContent =
-      "📍 GPS connected · ±" +
-      Math.round(gps.accuracy) + " meters";
-
-    if (!previous && latestOffers.length) {
-      show(latestOffers);
-    } else if (
-      previous &&
-      milesBetween(
-        previous.lat, previous.lon,
-        gps.lat, gps.lon
-      ) > 0.5
-    ) {
-      activeCards.forEach(card => card.recalculate());
-    }
-  }
+  fileInput?.parentElement?.insertBefore(
+    gpsStatus, fileInput
+  );
 
   if (navigator.geolocation) {
     navigator.geolocation.watchPosition(
-      locationUpdate,
+      position => {
+        currentLocation = {
+          lat: position.coords.latitude,
+          lon: position.coords.longitude,
+          accuracy: position.coords.accuracy,
+          time: position.timestamp
+        };
+        gpsStatus.textContent =
+          "📍 GPS connected · accuracy approximately " +
+          Math.round(currentLocation.accuracy) + " m";
+      },
       error => {
+        currentLocation = null;
         gpsStatus.textContent =
           "⚠ GPS unavailable: " + error.message;
       },
       {
         enableHighAccuracy: true,
-        maximumAge: 0,
+        maximumAge: 5000,
         timeout: 20000
       }
     );
   } else {
-    gpsStatus.textContent = "GPS unsupported.";
+    gpsStatus.textContent = "GPS not supported.";
   }
 
-  async function geocodeAddress(address, loc) {
-    if (!address || !/\d+\s+\S+/.test(address)) {
-      return null;
-    }
-
-    const queries = [
-      address,
-      address + ", Orlando, Florida",
-      address + ", Florida"
-    ];
-
-    const streetNumber =
-      address.match(/\b\d{2,6}\b/)?.[0];
-
-    for (const query of queries) {
-      try {
-        const url =
-          "https://nominatim.openstreetmap.org/search" +
-          "?format=json&limit=5&addressdetails=1&q=" +
-          encodeURIComponent(query);
-
-        const response = await fetch(url);
-        if (!response.ok) continue;
-
-        const places = await response.json();
-
-        for (const place of places) {
-          const point = {
-            name: place.display_name,
-            address: place.display_name,
-            lat: Number(place.lat),
-            lon: Number(place.lon),
-            source: "screenshot"
-          };
-
-          if (!valid(point)) continue;
-
-          const returnedNumber =
-            String(place.address?.house_number || "");
-
-          if (
-            streetNumber &&
-            returnedNumber !== streetNumber
-          ) continue;
-
-          if (!returnedNumber) {
-            const numbers =
-              point.address.match(/\b\d{2,6}\b/g) || [];
-
-            if (!numbers.includes(streetNumber)) continue;
-          }
-
-          point.distance = milesBetween(
-            loc.lat, loc.lon,
-            point.lat, point.lon
-          );
-
-          return point;
-        }
-      } catch (error) {
-        console.warn("Address search:", error);
-      }
-    }
-
-    return null;
+  function text(parent, tag, value, cls) {
+    const el = document.createElement(tag);
+    el.textContent = value;
+    if (cls) el.className = cls;
+    parent.append(el);
+    return el;
   }
 
-  async function findNearby(brand, loc) {
-    if (!brand) return [];
-
-    const pattern = brand
-      .replace(/[^a-zA-Z0-9 ]/g, ".")
-      .replace(/\s+/g, ".?");
-
-    const query =
-      '[out:json][timeout:18];' +
-      '(nwr["shop"]["name"~"' +
-      pattern +
-      '",i](around:24000,' +
-      loc.lat + ',' + loc.lon +
-      '););out center 70;';
-
-    const controller = new AbortController();
-    const timer = setTimeout(
-      () => controller.abort(), 18000
+  function distanceMiles(a, b, c, d) {
+    const rad = x => x * Math.PI / 180;
+    const deltaLat = rad(c - a);
+    const deltaLon = rad(d - b);
+    const h =
+      Math.sin(deltaLat / 2) ** 2 +
+      Math.cos(rad(a)) * Math.cos(rad(c)) *
+      Math.sin(deltaLon / 2) ** 2;
+    return 3958.8 * 2 * Math.asin(
+      Math.min(1, Math.sqrt(h))
     );
+  }
 
-    let places = [];
+  async function findBranches(brand, loc) {
+    const key = brand + ":" +
+      loc.lat.toFixed(2) + ":" + loc.lon.toFixed(2);
 
-    try {
-      const response = await fetch(
-        "https://overpass.kumi.systems/api/interpreter",
-        {
-          method: "POST",
-          body: new URLSearchParams({data:query}),
-          signal: controller.signal
-        }
-      );
+    if (cache.has(key)) return cache.get(key);
 
-      if (!response.ok) {
-        throw new Error("Store lookup unavailable");
-      }
+    const radius = 0.35;
+    const box = [
+      loc.lon - radius,
+      loc.lat + radius,
+      loc.lon + radius,
+      loc.lat - radius
+    ].join(",");
 
-      const data = await response.json();
+    const url =
+      "https://nominatim.openstreetmap.org/search" +
+      "?format=json&addressdetails=1&limit=30" +
+      "&viewbox=" + encodeURIComponent(box) +
+      "&bounded=1&q=" + encodeURIComponent(brand);
 
-      places = (data.elements || []).map(item => ({
-        name: item.tags?.name || brand,
-        address: [
-          item.tags?.["addr:housenumber"],
-          item.tags?.["addr:street"],
-          item.tags?.["addr:city"]
-        ].filter(Boolean).join(" "),
-        lat: Number(item.lat ?? item.center?.lat),
-        lon: Number(item.lon ?? item.center?.lon),
-        source: "alternative"
-      }));
+    const response = await fetch(url);
 
-    } catch (error) {
-      console.warn("Nearby search:", error);
-    } finally {
-      clearTimeout(timer);
+    if (!response.ok) {
+      throw new Error("Store search unavailable.");
     }
 
-    const seen = new Set();
+    const data = await response.json();
 
-    return places
-      .filter(valid)
-      .map(point => ({
-        ...point,
-        distance: milesBetween(
+    const branches = data
+      .map(place => ({
+        name: place.display_name,
+        lat: Number(place.lat),
+        lon: Number(place.lon)
+      }))
+      .filter(place =>
+        Number.isFinite(place.lat) &&
+        Number.isFinite(place.lon)
+      )
+      .map(place => ({
+        ...place,
+        distance: distanceMiles(
           loc.lat, loc.lon,
-          point.lat, point.lon
+          place.lat, place.lon
         )
       }))
-      .filter(point => point.distance <= 25)
-      .sort((a,b) => a.distance-b.distance)
-      .filter(point => {
-        const key =
-          point.lat.toFixed(4) + "," +
-          point.lon.toFixed(4);
+      .filter(place => place.distance <= 25)
+      .sort((a, b) => a.distance - b.distance);
 
-        if (seen.has(key)) return false;
-        seen.add(key);
-        return true;
-      })
-      .slice(0,20);
+    cache.set(key, branches);
+    return branches;
   }
 
-  async function roadRoute(destination, loc) {
+  async function drivingRoute(destination, loc) {
     const url =
       "https://router.project-osrm.org/route/v1/driving/" +
       loc.lon + "," + loc.lat + ";" +
@@ -286,13 +747,13 @@
     const response = await fetch(url);
 
     if (!response.ok) {
-      throw new Error("Road routing unavailable");
+      throw new Error("Road routing unavailable.");
     }
 
     const data = await response.json();
 
     if (data.code !== "Ok" || !data.routes?.length) {
-      throw new Error("No road route found");
+      throw new Error("No road route found.");
     }
 
     return {
@@ -301,8 +762,8 @@
     };
   }
 
-  function evaluate(batch, drive, brand) {
-    const multiplier = mult(brand);
+  function calculate(batch, drive) {
+    const multiplier = mult(batch.store);
 
     const fast =
       drive +
@@ -331,295 +792,264 @@
     };
   }
 
-  // Replace the old results display, not the OCR scanner.
+  // Replace only the display logic.
+  // The original screenshot recognition remains untouched.
   show = function(offers) {
-    latestOffers = offers;
-    const currentRun = ++generation;
-
+    const results = document.getElementById("results");
     const cards = document.getElementById("cards");
-    document.getElementById("results").hidden = false;
 
+    results.hidden = false;
     cards.replaceChildren();
-    activeCards = [];
 
     if (!offers.length) {
-      add(cards, "p",
+      text(cards, "p",
         "No batches recognized. Check extracted text.",
         "warn");
       return;
     }
 
     offers.forEach((batch, index) => {
-      const card = add(cards, "div", undefined, "offer");
+      const card = document.createElement("div");
+      card.className = "offer";
 
-      add(card, "h3",
-        "Batch " + (index+1) + " · " +
+      text(card, "h3",
+        "Batch " + (index + 1) + " · " +
         (batch.pay === null
           ? "Payment missing"
           : money(batch.pay)));
 
-      add(card, "p",
+      text(card, "p",
         (batch.items ?? "?") + " items · " +
         batch.deliveries + " deliveries · " +
         batch.shopOnly + " Shop Only · " +
         (batch.miles ?? "?") + " miles");
 
       if (batch.address) {
-        add(card, "p",
-          "📍 Screenshot store address: " +
+        text(card, "p",
+          "Screenshot address (NOT verified pickup): " +
           batch.address, "muted small");
       }
 
       const missing = [];
-
       if (batch.pay === null) missing.push("payment");
       if (batch.items === null) missing.push("items");
       if (batch.miles === null) missing.push("mileage");
 
       if (missing.length) {
-        add(card, "p",
-          "NEEDS DETAILS: " + missing.join(", "),
+        text(card, "p",
+          "NEEDS DETAILS: Missing " + missing.join(", "),
           "warn");
+        cards.append(card);
         return;
       }
 
-      const area = add(card, "div", undefined, "gps-card");
+      const area = document.createElement("div");
+      area.className = "gps-card";
+      card.append(area);
 
-      add(area, "p",
-        "Store brand:", "muted small");
+      text(area, "p",
+        "Confirm the store brand:",
+        "muted small");
 
-      const brandSelect = add(area, "select");
-      const placeholder =
-        add(brandSelect, "option", "Select store brand");
-      placeholder.value = "";
+      const brandSelect = document.createElement("select");
+
+      const blank = document.createElement("option");
+      blank.value = "";
+      blank.textContent = "Choose store brand";
+      brandSelect.append(blank);
 
       brands.forEach(name => {
-        const option = add(brandSelect, "option", name);
+        const option = document.createElement("option");
         option.value = name;
+        option.textContent = name;
+        brandSelect.append(option);
       });
 
-      const detected = brands.find(name =>
+      // OCR-derived brand is a hint, not a verified pickup.
+      const suggested = brands.find(name =>
         name.toLowerCase() ===
         String(batch.store).toLowerCase()
       );
 
-      if (detected) brandSelect.value = detected;
+      if (suggested) brandSelect.value = suggested;
 
-      const branchSelect = add(area, "select");
+      area.append(brandSelect);
+
+      const findButton = document.createElement("button");
+      findButton.type = "button";
+      findButton.textContent = "📍 Find nearby branches";
+      area.append(findButton);
+
+      const branchSelect = document.createElement("select");
       branchSelect.hidden = true;
+      area.append(branchSelect);
 
-      const output = add(
+      const routeButton = document.createElement("button");
+      routeButton.type = "button";
+      routeButton.textContent = "Calculate GPS drive";
+      routeButton.hidden = true;
+      area.append(routeButton);
+
+      const output = text(
         area, "p",
-        "Waiting for GPS and screenshot address...",
+        "PROVISIONAL · Pickup branch not verified.",
         "gps-note"
       );
 
-      const details = add(area, "p", "", "muted small");
-      const note = add(area, "p", "", "gps-note");
-
-      const refresh = add(
-        area, "button", "Refresh store locations"
-      );
-      refresh.type = "button";
-
-      let branches = [];
-      let selected = null;
-      let sequence = 0;
-
-      async function recalculate() {
-        if (!gps || !selected) return;
-
-        const token = ++sequence;
-        const loc = {...gps};
-        const branch = selected;
-
-        output.className = "gps-note";
-        output.textContent =
-          "Calculating GPS driving time...";
-
-        try {
-          const route = await roadRoute(branch, loc);
-
-          if (
-            token !== sequence ||
-            currentRun !== generation
-          ) return;
-
-          const calculation = evaluate(
-            batch,
-            route.minutes,
-            brandSelect.value || batch.store
-          );
-
-          if (!calculation) {
-            throw new Error("Invalid batch details");
-          }
-
-          const take = calculation.midpoint >= 20;
-
-          output.className =
-            "gps-result " + (take ? "take" : "skip");
-
-          output.textContent =
-            (take ? "TAKE" : "SKIP") +
-            " · " + money(calculation.midpoint) +
-            "/hr midpoint";
-
-          details.textContent =
-            "GPS drive: " + route.minutes + " min · " +
-            route.miles.toFixed(1) + " road miles" +
-            "\nHourly range: " +
-            money(calculation.low) + "–" +
-            money(calculation.high) + "/hr" +
-            "\nTotal estimated time: " +
-            Math.round(calculation.fast) + "–" +
-            Math.round(calculation.slow) + " min";
-
-          note.textContent =
-            (branch.source === "screenshot"
-              ? "Using the screenshot's store address. "
-              : "PROVISIONAL: using an alternative branch. ") +
-            "Verify the location and screenshot details. " +
-            "Driving estimate excludes live traffic.";
-
-        } catch (error) {
-          if (token !== sequence) return;
-
-          output.className = "gps-note";
-          output.textContent =
-            "Unable to calculate: " + error.message;
-
-          details.textContent = "";
-        }
-      }
-
-      function populateBranches() {
-        branchSelect.replaceChildren();
-
-        branches.forEach((branch, i) => {
-          const label =
-            (branch.source === "screenshot"
-              ? "📍 SCREENSHOT PICKUP · "
-              : "Alternative · ") +
-            (branch.address || branch.name) +
-            " · " + branch.distance.toFixed(1) +
-            " mi away";
-
-          const option = add(branchSelect, "option", label);
-          option.value = String(i);
-        });
-
-        branchSelect.hidden = !branches.length;
-        branchSelect.value = "0";
-        selected = branches[0] || null;
-      }
-
-      async function search() {
-        const token = ++sequence;
-        selected = null;
-        branches = [];
+      brandSelect.addEventListener("change", () => {
         branchSelect.hidden = true;
-        details.textContent = "";
-
-        if (!gps) {
-          output.textContent =
-            "Waiting for phone GPS permission...";
-          return;
-        }
-
-        const loc = {...gps};
-
+        routeButton.hidden = true;
         output.textContent =
-          "Locating screenshot pickup address...";
+          "PROVISIONAL · Find and select the pickup branch.";
+      });
 
-        let screenshotStore = null;
-
-        if (batch.address) {
-          screenshotStore = await geocodeAddress(
-            batch.address, loc
-          );
-        }
-
-        if (
-          token !== sequence ||
-          currentRun !== generation
-        ) return;
-
-        // Calculate from screenshot address immediately,
-        // without waiting for alternative store searches.
-        if (screenshotStore) {
-          branches = [screenshotStore];
-          populateBranches();
-          await recalculate();
-        } else {
+      findButton.addEventListener("click", async () => {
+        if (!currentLocation) {
           output.textContent =
-            "Screenshot address not located. " +
-            "Searching nearby store branches...";
+            "GPS unavailable. Allow location access and retry.";
+          return;
         }
 
         if (!brandSelect.value) {
-          if (!screenshotStore) {
-            output.textContent =
-              "Could not locate screenshot address. " +
-              "Select the store brand to find alternatives.";
-          }
+          output.textContent =
+            "Select the store brand first.";
           return;
         }
 
-        let nearby = [];
+        findButton.disabled = true;
+        output.textContent = "Searching nearby branches...";
 
         try {
-          nearby = await findNearby(
-            brandSelect.value, loc
+          const found = await findBranches(
+            brandSelect.value, currentLocation
           );
-        } catch (error) {
-          console.warn("Store search failed:", error);
-        }
 
-        if (currentRun !== generation) return;
+          branchSelect.replaceChildren();
 
-        const alternatives = nearby.filter(point =>
-          !screenshotStore ||
-          milesBetween(
-            point.lat, point.lon,
-            screenshotStore.lat, screenshotStore.lon
-          ) > 0.15
-        );
+          if (!found.length) {
+            output.textContent =
+              "No nearby branches found. " +
+              "Store database may be incomplete. " +
+              "No TAKE/SKIP recommendation.";
+            return;
+          }
 
-        branches = screenshotStore
-          ? [screenshotStore, ...alternatives]
-          : alternatives;
+          const prompt = document.createElement("option");
+          prompt.value = "";
+          prompt.textContent = "Select actual pickup branch";
+          branchSelect.append(prompt);
 
-        if (!branches.length) {
+          found.forEach((branch, i) => {
+            const option = document.createElement("option");
+            option.value = String(i);
+            option.textContent =
+              branch.name + " · " +
+              branch.distance.toFixed(1) + " mi away";
+            branchSelect.append(option);
+          });
+
+          branchSelect.hidden = false;
+          routeButton.hidden = false;
+
           output.textContent =
-            "No verified pickup address or nearby " +
-            "store locations found. No TAKE/SKIP.";
-          return;
+            found.length + " possible branches found. " +
+            "Select the actual Instacart pickup location.";
+
+          routeButton.onclick = async () => {
+            if (branchSelect.value === "") {
+              output.textContent =
+                "Choose the correct pickup branch.";
+              return;
+            }
+
+            const branch = found[Number(branchSelect.value)];
+            routeButton.disabled = true;
+            output.textContent = "Calculating road drive...";
+
+            try {
+              if (!currentLocation) {
+                throw new Error("GPS unavailable.");
+              }
+
+              const route = await drivingRoute(
+                branch, currentLocation
+              );
+
+              // Use confirmed brand for store multiplier.
+              const correctedBatch = {
+                ...batch,
+                store: brandSelect.value
+              };
+
+              const calc = calculate(
+                correctedBatch, route.minutes
+              );
+
+              if (!calc) {
+                throw new Error("Invalid batch calculation.");
+              }
+
+              const take = calc.midpoint >= 20;
+
+              output.className =
+                "gps-result " + (take ? "take" : "skip");
+
+              output.textContent =
+                (take ? "TAKE" : "SKIP") +
+                " · " + money(calc.midpoint) +
+                "/hr midpoint";
+
+              text(area, "p",
+                "GPS road drive: " + route.minutes +
+                " min · " + route.miles.toFixed(1) +
+                " road miles", "muted");
+
+              text(area, "p",
+                "Hourly range: " +
+                money(calc.low) + "–" +
+                money(calc.high) + "/hr · " +
+                Math.round(calc.fast) + "–" +
+                Math.round(calc.slow) + " min total",
+                "muted");
+
+              text(area, "p",
+                "Pickup selected: " + branch.name,
+                "muted small");
+
+              text(area, "p",
+                "Road estimate excludes live traffic. " +
+                "Confirm the selected branch, screenshot " +
+                "details and pickup assignment. " +
+                "Recalculate if your location changes.",
+                "gps-note");
+
+              routeButton.hidden = true;
+              branchSelect.disabled = true;
+              brandSelect.disabled = true;
+
+            } catch (error) {
+              output.className = "gps-note";
+              output.textContent =
+                "PROVISIONAL · " + error.message;
+            } finally {
+              routeButton.disabled = false;
+            }
+          };
+
+        } catch (error) {
+          output.textContent =
+            "Store search failed: " + error.message;
+        } finally {
+          findButton.disabled = false;
         }
-
-        populateBranches();
-
-        // If the screenshot address was found,
-        // preserve it as the selected location.
-        // Otherwise estimate using the closest branch.
-        if (!screenshotStore) {
-          await recalculate();
-        }
-      }
-
-      branchSelect.addEventListener("change", () => {
-        selected =
-          branches[Number(branchSelect.value)] || null;
-        recalculate();
       });
 
-      brandSelect.addEventListener("change", search);
-      refresh.addEventListener("click", search);
-
-      activeCards.push({recalculate});
-
-      if (gps) search();
+      cards.append(card);
     });
   };
 })();
 </script>
+
+
+</body>
+</html>
