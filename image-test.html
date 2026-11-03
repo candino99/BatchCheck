@@ -1,92 +1,584 @@
+
 <!doctype html>
 <html lang="en">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
 <title>BatchCheck · Image Test</title>
 <style>
-:root{color-scheme:dark}body{margin:0;background:#0b1224;color:#f5f8ff;font:16px system-ui,-apple-system,sans-serif}main{max-width:720px;margin:auto;padding:24px 18px 60px}h1{font-size:30px}h2{font-size:21px}p,.muted{color:#afbed8;line-height:1.5}.panel,.offer{background:#152139;border:1px solid #354563;border-radius:18px;padding:20px;margin:18px 0}input,button{font:inherit}input[type=file]{display:block;max-width:100%;margin:14px 0}button{background:#63daa1;color:#092519;border:0;border-radius:12px;padding:13px 20px;font-weight:700}button:disabled{opacity:.45}img{width:100%;max-height:480px;object-fit:contain;border-radius:10px;background:#0b1224}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0a1427;padding:14px;border-radius:10px;max-height:330px;overflow:auto}summary{cursor:pointer}strong{color:white}.warn{color:#ffcc80}.take{color:#76e6ac}.skip{color:#ff8b9b}.status{font-size:14px}.offer h3{margin:0 0 10px}label{display:block;margin:12px 0}input[type=number]{background:#0b1224;border:1px solid #50607a;color:white;padding:10px;width:90px;border-radius:8px}
+:root{color-scheme:dark}
+*{box-sizing:border-box}
+body{margin:0;background:#0b1224;color:#f5f8ff;font:16px system-ui,-apple-system,sans-serif}
+main{max-width:720px;margin:auto;padding:24px 18px 60px}
+h1{font-size:30px}
+h2{font-size:21px}
+p,.muted{color:#afbed8;line-height:1.5}
+.panel,.offer{background:#152139;border:1px solid #354563;border-radius:18px;padding:20px;margin:18px 0}
+input,button{font:inherit}
+input[type=file]{display:block;max-width:100%;margin:14px 0}
+button{background:#63daa1;color:#092519;border:0;border-radius:12px;padding:13px 20px;font-weight:700;cursor:pointer}
+button:disabled{opacity:.45}
+img{width:100%;max-height:480px;object-fit:contain;border-radius:10px;background:#0b1224}
+pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0a1427;padding:14px;border-radius:10px;max-height:330px;overflow:auto}
+summary{cursor:pointer}
+strong{color:white}
+.warn{color:#ffcc80}
+.take{color:#76e6ac}
+.skip{color:#ff8b9b}
+.status{font-size:14px}
+.offer h3{margin:0 0 10px}
+label{display:block;margin:12px 0}
+input[type=number]{background:#0b1224;border:1px solid #50607a;color:white;padding:10px;width:90px;border-radius:8px}
+.small{font-size:13px}
 </style>
 </head>
-<body><main>
+<body>
+<main>
+
 <h1>BatchCheck <span style="color:#63daa1">Image Test</span></h1>
-<p>Experimental full-screen image recognition. This does not change your regular BatchCheck or Shortcut. The image is processed in your browser; OCR software is downloaded on first use.</p>
-<section class="panel"><h2>1. Choose an Instacart screenshot</h2><input id="file" type="file" accept="image/*"><img id="preview" hidden alt="Selected screenshot"><label>Assumed drive to store (minutes): <input id="drive" type="number" min="0" value="10"></label><button id="scan" disabled>Read screenshot</button><p id="status" class="status" aria-live="polite">Select a screenshot to begin.</p></section>
-<section id="results" class="panel" hidden><h2>2. Recognized batches</h2><div id="cards"></div><details><summary>Show extracted text (for troubleshooting)</summary><pre id="raw"></pre></details></section>
-<p class="muted">Estimates are gross, not guaranteed. Always verify the store, payment, item count, mileage, and drive time before accepting an offer. Unknown or incomplete offers are not given TAKE/SKIP.</p>
+
+<p>
+Full-screen screenshot recognition with a second pass for payment amounts.
+No manual cropping required. Images are processed in your browser.
+</p>
+
+<section class="panel">
+<h2>1. Choose an Instacart screenshot</h2>
+
+<input id="file" type="file" accept="image/*">
+
+<img id="preview" hidden alt="Selected screenshot">
+
+<label>
+Assumed drive to store (minutes):
+<input id="drive" type="number" min="0" value="10">
+</label>
+
+<button id="scan" disabled>Read screenshot</button>
+
+<p id="status" class="status" aria-live="polite">
+Select a screenshot to begin.
+</p>
+</section>
+
+<section id="results" class="panel" hidden>
+<h2>2. Recognized batches</h2>
+<div id="cards"></div>
+
+<details>
+<summary>Show extracted text (for troubleshooting)</summary>
+<pre id="raw"></pre>
+</details>
+</section>
+
+<p class="muted">
+Estimates are gross, not guaranteed. Always verify the store,
+payment, item count, mileage, and drive time before accepting.
+Unknown or incomplete offers are not given TAKE/SKIP.
+</p>
+
 </main>
+
 <script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+
 <script>
 'use strict';
-const $=id=>document.getElementById(id);
-const money=n=>'$'+n.toFixed(2);
-const mult=name=>/h[ -]?mart/i.test(name)?2:/costco|sam'?s club|target/i.test(name)?1.5:/publix/i.test(name)?1:/aldi|sprouts|fresh market/i.test(name)?1.25:1.25;
-const stores=[[/2550\s+n\s+hiawassee/i,'Walgreens'],[/1720\s+e\s+silver\s+star/i,'Publix'],[/741\s+s\s+orlando/i,'Publix'],[/11055\s+daryl\s+carter/i,'Publix'],[/1500\s+(?:north|n)\s+mills/i,'The Fresh Market'],[/2701\s+n\s+hiawassee/i,'Bravo']];
-const payRe=/\$\s*(\d{1,4})[.,](\d{2})(?:\d)?\b/;
-const orderRe=/(\d+)\s*(shop\s*(?:&|and|\+)\s*deliver|shop\s*only|delivery\s*only)/i;
-const itemRe=/(\d+)\s*items?\s*(?:\(\s*(\d+)\s*units?\s*\))?/i;
-const milesRe=/(\d+(?:[.,]\d+)?)\s*(?:mi|miles?)\b/i;
-function parse(text){
- const lines=text.replace(/\r/g,'\n').split('\n').map(s=>s.trim()).filter(Boolean);
- const starts=[];
- for(let i=0;i<lines.length;i++){
-  const p=lines[i].match(payRe);if(!p)continue;
-  const pay=Number(p[1]+'.'+p[2]);if(pay<=0)continue;
-  const nearby=lines.slice(i+1,i+8).some(x=>orderRe.test(x));
-  if(nearby)starts.push({i,pay});
- }
- const found=[];
- for(let k=0;k<starts.length;k++){
-  const {i,pay}=starts[k],end=k+1<starts.length?starts[k+1].i:lines.length;
-  const section=lines.slice(i+1,end);
-  const o=section.find(x=>orderRe.test(x))?.match(orderRe);
-  const it=section.find(x=>itemRe.test(x))?.match(itemRe);
-  const mi=section.find(x=>milesRe.test(x))?.match(milesRe);
-  if(!o||!it||!mi){found.push({pay,error:'Missing order, items, or miles in OCR'});continue;}
-  const address=section.find(x=>/\d{2,}\s+.+(?:rd|road|ave|avenue|pkwy|parkway|blvd|street)/i.test(x))||'';
-  const explicit=section.join(' ').match(/the fresh market|fresh market|publix|walgreens|bravo|aldi|sprouts|costco|sam'?s club|target|h[ -]?mart/i)?.[0];
-  const store=explicit||stores.find(([re])=>re.test(address))?.[1]||'Unknown store';
-  const count=Number(o[1]),shopOnly=/shop\s*only/i.test(o[2])?count:0;
-  found.push({pay,store,items:Number(it[1]),units:it[2]?Number(it[2]):null,miles:Number(mi[1].replace(',','.')),deliveries:shopOnly?0:count,shopOnly,address});
- }
- return found;
-}
-function show(offers){
- $('results').hidden=false;$('cards').replaceChildren();
- if(!offers.length){const p=document.createElement('p');p.className='warn';p.textContent='No complete payment-and-order groups detected. Check the extracted text below.';$('cards').append(p);return;}
- for(const b of offers){
-  const div=document.createElement('div');div.className='offer';
-  const title=document.createElement('h3');title.textContent=money(b.pay)+' · '+(b.store||'Needs review');div.append(title);
-  const info=document.createElement('p');
-  if(b.error){info.className='warn';info.textContent='NEEDS DETAILS: '+b.error;div.append(info);$('cards').append(div);continue;}
-  info.textContent=`${b.items} items · ${b.deliveries} deliveries · ${b.shopOnly} Shop Only · ${b.miles} miles`;div.append(info);
-  if(b.store==='Unknown store'){
-   const warning=document.createElement('p');warning.className='warn';warning.textContent='NEEDS DETAILS: Store unidentified; no TAKE/SKIP recommendation.';div.append(warning);
-  }else{
-   const drive=Number($('drive').value),m=mult(b.store);
-   const fast=drive+b.items*40/60*m+(b.items?10:0)+b.shopOnly*5+b.miles*2+b.deliveries*5;
-   const slow=drive+b.items*55/60*m+(b.items?20:0)+b.shopOnly*5+b.miles*4+b.deliveries*10;
-   const midpoint=(b.pay*60/fast+b.pay*60/slow)/2;
-   const result=document.createElement('p');result.className=midpoint>=20?'take':'skip';result.textContent=`${midpoint>=20?'TAKE':'SKIP'} · ${money(midpoint)}/hr midpoint · ${Math.round(fast)}–${Math.round(slow)} min estimated`;div.append(result);
+
+const $ = id => document.getElementById(id);
+const money = n => '$' + Number(n).toFixed(2);
+
+const mult = name =>
+  /h[ -]?mart/i.test(name) ? 2 :
+  /costco|sam'?s club|target/i.test(name) ? 1.5 :
+  /publix/i.test(name) ? 1 :
+  /aldi|sprouts|fresh market/i.test(name) ? 1.25 :
+  1.25;
+
+const stores = [
+  [/2550\s+n\s+hiawassee/i,'Walgreens'],
+  [/1720\s+e\s+silver\s+star/i,'Publix'],
+  [/741\s+s\s+orlando/i,'Publix'],
+  [/11055\s+daryl\s+carter/i,'Publix'],
+  [/1500\s+(?:north|n)\s+mills/i,'The Fresh Market'],
+  [/2701\s+n\s+hiawassee/i,'Bravo']
+];
+
+const orderRe =
+  /(\d+)\s*(shop\s*(?:&|and|\+)\s*deliver|shop\s*only|delivery\s*only)/i;
+
+const itemRe =
+  /(\d+)\s*items?\s*(?:\(\s*(\d+)\s*units?\s*\))?/i;
+
+const milesRe =
+  /(\d+(?:[.,]\d+)?)\s*(?:mi|miles?)\b/i;
+
+function getPrice(text, allowBare=false) {
+  const clean = String(text)
+    .replace(/[＄]/g,'$')
+    .replace(/[，]/g,',')
+    .replace(/[．]/g,'.');
+
+  const withDollar =
+    clean.match(/\$\s*(\d{1,4})\s*[.,]\s*(\d{2})/);
+
+  if (withDollar) {
+    const value = Number(withDollar[1]+'.'+withDollar[2]);
+    if (value > 0 && value < 1000) return value;
   }
-  const warning=document.createElement('p');warning.className='warn';warning.textContent='Drive time assumed; confirm OCR details before accepting.';div.append(warning);
-  $('cards').append(div);
- }
+
+  if (allowBare) {
+    const lines = clean.split('\n').map(x=>x.trim());
+
+    for (const line of lines) {
+      if (/pts|items|units|mi|deliver|shop/i.test(line)) continue;
+
+      const bare = line.match(
+        /^(?:[$S]\s*)?(\d{1,3})\s*[.,]\s*(\d{2})[¢🔥\s]*$/
+      );
+
+      if (bare) {
+        const value = Number(bare[1]+'.'+bare[2]);
+        if (value >= 1 && value < 1000) return value;
+      }
+    }
+  }
+
+  return null;
 }
-$('file').addEventListener('change',()=>{const f=$('file').files[0];$('scan').disabled=!f;if(f){$('preview').src=URL.createObjectURL(f);$('preview').hidden=false;$('status').textContent='Ready to scan '+f.name;}});
-$('scan').addEventListener('click',async()=>{
- const file=$('file').files[0];if(!file)return;
- if(!window.Tesseract){$('status').textContent='OCR library could not load. Check internet connection.';return;}
- $('scan').disabled=true;$('results').hidden=true;
- let worker;
- try{
-  $('status').textContent='Loading image recognition…';
-  worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status)$('status').textContent=m.status+(m.progress?' '+Math.round(m.progress*100)+'%':'');}});
-  const result=await worker.recognize(file);
+
+function identifyStore(address, text) {
+  const explicit = String(text).match(
+    /the fresh market|fresh market|publix|walgreens|bravo|aldi|sprouts|costco|sam'?s club|target|h[ -]?mart/i
+  );
+
+  return explicit?.[0] ||
+    stores.find(([re])=>re.test(address))?.[1] ||
+    'Unknown store';
+}
+
+function parseOrders(text) {
+  const lines = String(text)
+    .replace(/\r/g,'\n')
+    .split('\n')
+    .map(s=>s.trim())
+    .filter(Boolean);
+
+  const starts = [];
+
+  for (let i=0;i<lines.length;i++) {
+    if (orderRe.test(lines[i])) starts.push(i);
+  }
+
+  const found = [];
+
+  for (let k=0;k<starts.length;k++) {
+    const start = starts[k];
+    const end = k+1<starts.length ? starts[k+1] : lines.length;
+
+    const section = lines.slice(start,end);
+    const order = section[0].match(orderRe);
+
+    if (!order) continue;
+
+    const items = section.find(x=>itemRe.test(x))?.match(itemRe);
+
+    const mileageLine = section.find(x=>milesRe.test(x));
+    const miles = mileageLine?.match(milesRe);
+
+    const address = section.find(x=>
+      /\d{2,}\s+.+(?:rd|road|ave|avenue|pkwy|parkway|blvd|street|dr|drive)/i.test(x)
+    ) || '';
+
+    const count = Number(order[1]);
+    const shopOnly = /shop\s*only/i.test(order[2]) ? count : 0;
+
+    // Look for a payment immediately above this order.
+    // Do not borrow a payment from another batch.
+    const preceding = lines.slice(Math.max(0,start-3),start);
+    let pay = null;
+
+    for (let j=preceding.length-1;j>=0;j--) {
+      const candidate = getPrice(preceding[j]);
+
+      if (candidate !== null) {
+        pay = candidate;
+        break;
+      }
+    }
+
+    found.push({
+      pay,
+      store:identifyStore(address,section.join(' ')),
+      items:items ? Number(items[1]) : null,
+      units:items?.[2] ? Number(items[2]) : null,
+      miles:miles ? Number(miles[1].replace(',','.')) : null,
+      deliveries:shopOnly ? 0 : count,
+      shopOnly,
+      address,
+      orderText:section[0],
+      sourceIndex:start
+    });
+  }
+
+  return found;
+}
+
+function makeCanvas(image,sx,sy,sw,sh,scale=3,threshold=false) {
+  const canvas=document.createElement('canvas');
+
+  sx=Math.max(0,Math.floor(sx));
+  sy=Math.max(0,Math.floor(sy));
+  sw=Math.min(Math.ceil(sw),image.naturalWidth-sx);
+  sh=Math.min(Math.ceil(sh),image.naturalHeight-sy);
+
+  if(sw<=0||sh<=0) return null;
+
+  canvas.width=Math.round(sw*scale);
+  canvas.height=Math.round(sh*scale);
+
+  const ctx=canvas.getContext('2d',{willReadFrequently:true});
+  ctx.fillStyle='#fff';
+  ctx.fillRect(0,0,canvas.width,canvas.height);
+
+  ctx.imageSmoothingEnabled=true;
+  ctx.imageSmoothingQuality='high';
+
+  ctx.drawImage(
+    image,sx,sy,sw,sh,
+    0,0,canvas.width,canvas.height
+  );
+
+  if(threshold) {
+    const data=ctx.getImageData(0,0,canvas.width,canvas.height);
+    const pixels=data.data;
+
+    for(let i=0;i<pixels.length;i+=4) {
+      const gray=
+        pixels[i]*0.299+
+        pixels[i+1]*0.587+
+        pixels[i+2]*0.114;
+
+      const v=gray<165 ? 0 : 255;
+      pixels[i]=v;
+      pixels[i+1]=v;
+      pixels[i+2]=v;
+    }
+
+    ctx.putImageData(data,0,0);
+  }
+
+  return canvas;
+}
+
+async function loadImage(file) {
+  const url=URL.createObjectURL(file);
+
+  try {
+    const image=new Image();
+    image.src=url;
+    await image.decode();
+    return image;
+  } finally {
+    URL.revokeObjectURL(url);
+  }
+}
+
+function findOrderBoxes(data) {
+  const lines=data.lines||[];
+
+  return lines
+    .filter(line=>orderRe.test(line.text||''))
+    .map(line=>({
+      text:line.text,
+      box:line.bbox
+    }))
+    .filter(x=>x.box&&Number.isFinite(x.box.y0))
+    .sort((a,b)=>a.box.y0-b.box.y0);
+}
+
+async function recognizePriceCrop(worker,canvas) {
+  if(!canvas) return {pay:null,text:''};
+
+  const result=await worker.recognize(canvas);
   const text=result.data.text||'';
-  $('raw').textContent=text;
-  const offers=parse(text);show(offers);
-  $('status').textContent=`Finished. ${offers.filter(x=>!x.error).length} complete offer(s) recognized. Review details below.`;
- }catch(e){$('status').textContent='Recognition failed: '+(e?.message||String(e));}
- finally{if(worker)await worker.terminate().catch(()=>{});$('scan').disabled=false;}
+
+  return {
+    pay:getPrice(text,true),
+    text
+  };
+}
+
+async function recoverPayments(worker,image,fullData,orders) {
+  const boxes=findOrderBoxes(fullData);
+  const debug=[];
+
+  if(!boxes.length) {
+    debug.push('No order positions detected in the first OCR pass.');
+    return debug;
+  }
+
+  const width=image.naturalWidth;
+  const height=image.naturalHeight;
+
+  // Match order rows to OCR boxes in their top-to-bottom order.
+  const count=Math.min(boxes.length,orders.length);
+
+  for(let i=0;i<count;i++) {
+    const order=orders[i];
+    const box=boxes[i].box;
+
+    if(order.pay!==null) continue;
+
+    $('status').textContent=
+      `Reading payment for batch ${i+1} of ${count}...`;
+
+    // The payment is above the "Shop & deliver" line,
+    // on the left side of the same card.
+    // Cropping happens automatically in memory.
+    const cropHeight=Math.max(65,Math.round(width*0.17));
+
+    const sx=Math.round(width*0.025);
+    const sy=Math.max(0,box.y0-cropHeight);
+    const sw=Math.round(width*0.64);
+    const sh=Math.max(1,box.y0-sy);
+
+    let recovered=null;
+
+    for(const threshold of [false,true]) {
+      const crop=makeCanvas(
+        image,sx,sy,sw,sh,3,threshold
+      );
+
+      const attempt=await recognizePriceCrop(worker,crop);
+
+      debug.push(
+        `Batch ${i+1} payment pass (${threshold?'high contrast':'normal'}):\n`+
+        attempt.text
+      );
+
+      if(attempt.pay!==null) {
+        recovered=attempt.pay;
+        break;
+      }
+    }
+
+    order.pay=recovered;
+  }
+
+  return debug;
+}
+
+function addText(parent,tag,value,className='') {
+  const el=document.createElement(tag);
+  el.textContent=value;
+  if(className) el.className=className;
+  parent.append(el);
+  return el;
+}
+
+function show(offers) {
+  $('results').hidden=false;
+  $('cards').replaceChildren();
+
+  if(!offers.length) {
+    addText(
+      $('cards'),'p',
+      'No batch order details recognized. Check the extracted text below.',
+      'warn'
+    );
+    return;
+  }
+
+  for(let i=0;i<offers.length;i++) {
+    const b=offers[i];
+    const div=document.createElement('div');
+    div.className='offer';
+
+    addText(
+      div,'h3',
+      `Batch ${i+1}: ${b.pay===null?'Payment missing':money(b.pay)} · ${b.store}`
+    );
+
+    addText(
+      div,'p',
+      `${b.items??'?'} items · ${b.deliveries} deliveries · `+
+      `${b.shopOnly} Shop Only · ${b.miles??'?'} miles`
+    );
+
+    if(b.address) {
+      addText(div,'p',b.address,'muted small');
+    }
+
+    const missing=[];
+
+    if(b.pay===null) missing.push('payment amount');
+    if(b.items===null) missing.push('item count');
+    if(b.miles===null) missing.push('mileage');
+    if(b.store==='Unknown store') missing.push('store identity');
+
+    if(missing.length) {
+      addText(
+        div,'p',
+        'NEEDS DETAILS: Missing '+missing.join(', ')+
+        '. No TAKE/SKIP recommendation.',
+        'warn'
+      );
+
+      $('cards').append(div);
+      continue;
+    }
+
+    const drive=Number($('drive').value);
+
+    if(!Number.isFinite(drive)||drive<0) {
+      addText(div,'p','NEEDS DETAILS: Invalid drive time.','warn');
+      $('cards').append(div);
+      continue;
+    }
+
+    const m=mult(b.store);
+
+    const fast=
+      drive+
+      b.items*40/60*m+
+      (b.items?10:0)+
+      b.shopOnly*5+
+      b.miles*2+
+      b.deliveries*5;
+
+    const slow=
+      drive+
+      b.items*55/60*m+
+      (b.items?20:0)+
+      b.shopOnly*5+
+      b.miles*4+
+      b.deliveries*10;
+
+    if(fast<=0||slow<=0) {
+      addText(div,'p','NEEDS DETAILS: Invalid time estimate.','warn');
+      $('cards').append(div);
+      continue;
+    }
+
+    const low=b.pay*60/slow;
+    const high=b.pay*60/fast;
+    const midpoint=(low+high)/2;
+    const take=midpoint>=20;
+
+    addText(
+      div,'p',
+      `${take?'TAKE':'SKIP'} · ${money(midpoint)}/hr midpoint · `+
+      `${Math.round(fast)}–${Math.round(slow)} min estimated`,
+      take?'take':'skip'
+    );
+
+    addText(
+      div,'p',
+      `Estimated hourly range: ${money(low)}–${money(high)}/hr`,
+      'muted'
+    );
+
+    addText(
+      div,'p',
+      'Drive time assumed; confirm OCR details before accepting.',
+      'warn'
+    );
+
+    $('cards').append(div);
+  }
+}
+
+$('file').addEventListener('change',()=>{
+  const file=$('file').files[0];
+
+  $('scan').disabled=!file;
+  $('results').hidden=true;
+
+  if(file) {
+    $('preview').src=URL.createObjectURL(file);
+    $('preview').hidden=false;
+    $('status').textContent='Ready to scan '+file.name;
+  }
 });
-</script></body></html>
+
+$('scan').addEventListener('click',async()=>{
+  const file=$('file').files[0];
+  if(!file)return;
+
+  if(!window.Tesseract) {
+    $('status').textContent=
+      'OCR library could not load. Check your internet connection.';
+    return;
+  }
+
+  $('scan').disabled=true;
+  $('results').hidden=true;
+
+  let worker;
+
+  try {
+    $('status').textContent='Loading image recognition...';
+
+    const image=await loadImage(file);
+
+    worker=await Tesseract.createWorker('eng',1,{
+      logger:m=>{
+        if(m.status&&m.status.includes('loading')) {
+          $('status').textContent=
+            m.status+
+            (m.progress?' '+Math.round(m.progress*100)+'%':'');
+        }
+      }
+    });
+
+    $('status').textContent='Reading the full screenshot...';
+
+    // Request positional OCR data so we can locate order rows.
+    const result=await worker.recognize(
+      file,
+      {},
+      {text:true,blocks:true}
+    );
+
+    const text=result.data.text||'';
+    const orders=parseOrders(text);
+
+    $('status').textContent=
+      `Found ${orders.length} order row(s). Checking payments...`;
+
+    const debug=await recoverPayments(
+      worker,image,result.data,orders
+    );
+
+    $('raw').textContent=
+      'FULL SCREEN OCR:\n'+text+
+      '\n\nSECOND-PASS PAYMENT OCR:\n'+
+      debug.join('\n---\n');
+
+    show(orders);
+
+    const complete=orders.filter(b=>
+      b.pay!==null&&
+      b.items!==null&&
+      b.miles!==null&&
+      b.store!=='Unknown store'
+    ).length;
+
+    $('status').textContent=
+      `Finished. ${orders.length} batch(es) found; `+
+      `${complete} complete. Review details below.`;
+
+  } catch(e) {
+    $('status').textContent=
+      'Recognition failed: '+(e?.message||String(e));
+  } finally {
+    if(worker) {
+      await worker.terminate().catch(()=>{});
+    }
+    $('scan').disabled=false;
+  }
+});
+</script>
+</body>
+</html>
+
