@@ -1,0 +1,92 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>BatchCheck · Image Test</title>
+<style>
+:root{color-scheme:dark}body{margin:0;background:#0b1224;color:#f5f8ff;font:16px system-ui,-apple-system,sans-serif}main{max-width:720px;margin:auto;padding:24px 18px 60px}h1{font-size:30px}h2{font-size:21px}p,.muted{color:#afbed8;line-height:1.5}.panel,.offer{background:#152139;border:1px solid #354563;border-radius:18px;padding:20px;margin:18px 0}input,button{font:inherit}input[type=file]{display:block;max-width:100%;margin:14px 0}button{background:#63daa1;color:#092519;border:0;border-radius:12px;padding:13px 20px;font-weight:700}button:disabled{opacity:.45}img{width:100%;max-height:480px;object-fit:contain;border-radius:10px;background:#0b1224}pre{white-space:pre-wrap;overflow-wrap:anywhere;background:#0a1427;padding:14px;border-radius:10px;max-height:330px;overflow:auto}summary{cursor:pointer}strong{color:white}.warn{color:#ffcc80}.take{color:#76e6ac}.skip{color:#ff8b9b}.status{font-size:14px}.offer h3{margin:0 0 10px}label{display:block;margin:12px 0}input[type=number]{background:#0b1224;border:1px solid #50607a;color:white;padding:10px;width:90px;border-radius:8px}
+</style>
+</head>
+<body><main>
+<h1>BatchCheck <span style="color:#63daa1">Image Test</span></h1>
+<p>Experimental full-screen image recognition. This does not change your regular BatchCheck or Shortcut. The image is processed in your browser; OCR software is downloaded on first use.</p>
+<section class="panel"><h2>1. Choose an Instacart screenshot</h2><input id="file" type="file" accept="image/*"><img id="preview" hidden alt="Selected screenshot"><label>Assumed drive to store (minutes): <input id="drive" type="number" min="0" value="10"></label><button id="scan" disabled>Read screenshot</button><p id="status" class="status" aria-live="polite">Select a screenshot to begin.</p></section>
+<section id="results" class="panel" hidden><h2>2. Recognized batches</h2><div id="cards"></div><details><summary>Show extracted text (for troubleshooting)</summary><pre id="raw"></pre></details></section>
+<p class="muted">Estimates are gross, not guaranteed. Always verify the store, payment, item count, mileage, and drive time before accepting an offer. Unknown or incomplete offers are not given TAKE/SKIP.</p>
+</main>
+<script src="https://cdn.jsdelivr.net/npm/tesseract.js@5/dist/tesseract.min.js"></script>
+<script>
+'use strict';
+const $=id=>document.getElementById(id);
+const money=n=>'$'+n.toFixed(2);
+const mult=name=>/h[ -]?mart/i.test(name)?2:/costco|sam'?s club|target/i.test(name)?1.5:/publix/i.test(name)?1:/aldi|sprouts|fresh market/i.test(name)?1.25:1.25;
+const stores=[[/2550\s+n\s+hiawassee/i,'Walgreens'],[/1720\s+e\s+silver\s+star/i,'Publix'],[/741\s+s\s+orlando/i,'Publix'],[/11055\s+daryl\s+carter/i,'Publix'],[/1500\s+(?:north|n)\s+mills/i,'The Fresh Market'],[/2701\s+n\s+hiawassee/i,'Bravo']];
+const payRe=/\$\s*(\d{1,4})[.,](\d{2})(?:\d)?\b/;
+const orderRe=/(\d+)\s*(shop\s*(?:&|and|\+)\s*deliver|shop\s*only|delivery\s*only)/i;
+const itemRe=/(\d+)\s*items?\s*(?:\(\s*(\d+)\s*units?\s*\))?/i;
+const milesRe=/(\d+(?:[.,]\d+)?)\s*(?:mi|miles?)\b/i;
+function parse(text){
+ const lines=text.replace(/\r/g,'\n').split('\n').map(s=>s.trim()).filter(Boolean);
+ const starts=[];
+ for(let i=0;i<lines.length;i++){
+  const p=lines[i].match(payRe);if(!p)continue;
+  const pay=Number(p[1]+'.'+p[2]);if(pay<=0)continue;
+  const nearby=lines.slice(i+1,i+8).some(x=>orderRe.test(x));
+  if(nearby)starts.push({i,pay});
+ }
+ const found=[];
+ for(let k=0;k<starts.length;k++){
+  const {i,pay}=starts[k],end=k+1<starts.length?starts[k+1].i:lines.length;
+  const section=lines.slice(i+1,end);
+  const o=section.find(x=>orderRe.test(x))?.match(orderRe);
+  const it=section.find(x=>itemRe.test(x))?.match(itemRe);
+  const mi=section.find(x=>milesRe.test(x))?.match(milesRe);
+  if(!o||!it||!mi){found.push({pay,error:'Missing order, items, or miles in OCR'});continue;}
+  const address=section.find(x=>/\d{2,}\s+.+(?:rd|road|ave|avenue|pkwy|parkway|blvd|street)/i.test(x))||'';
+  const explicit=section.join(' ').match(/the fresh market|fresh market|publix|walgreens|bravo|aldi|sprouts|costco|sam'?s club|target|h[ -]?mart/i)?.[0];
+  const store=explicit||stores.find(([re])=>re.test(address))?.[1]||'Unknown store';
+  const count=Number(o[1]),shopOnly=/shop\s*only/i.test(o[2])?count:0;
+  found.push({pay,store,items:Number(it[1]),units:it[2]?Number(it[2]):null,miles:Number(mi[1].replace(',','.')),deliveries:shopOnly?0:count,shopOnly,address});
+ }
+ return found;
+}
+function show(offers){
+ $('results').hidden=false;$('cards').replaceChildren();
+ if(!offers.length){const p=document.createElement('p');p.className='warn';p.textContent='No complete payment-and-order groups detected. Check the extracted text below.';$('cards').append(p);return;}
+ for(const b of offers){
+  const div=document.createElement('div');div.className='offer';
+  const title=document.createElement('h3');title.textContent=money(b.pay)+' · '+(b.store||'Needs review');div.append(title);
+  const info=document.createElement('p');
+  if(b.error){info.className='warn';info.textContent='NEEDS DETAILS: '+b.error;div.append(info);$('cards').append(div);continue;}
+  info.textContent=`${b.items} items · ${b.deliveries} deliveries · ${b.shopOnly} Shop Only · ${b.miles} miles`;div.append(info);
+  if(b.store==='Unknown store'){
+   const warning=document.createElement('p');warning.className='warn';warning.textContent='NEEDS DETAILS: Store unidentified; no TAKE/SKIP recommendation.';div.append(warning);
+  }else{
+   const drive=Number($('drive').value),m=mult(b.store);
+   const fast=drive+b.items*40/60*m+(b.items?10:0)+b.shopOnly*5+b.miles*2+b.deliveries*5;
+   const slow=drive+b.items*55/60*m+(b.items?20:0)+b.shopOnly*5+b.miles*4+b.deliveries*10;
+   const midpoint=(b.pay*60/fast+b.pay*60/slow)/2;
+   const result=document.createElement('p');result.className=midpoint>=20?'take':'skip';result.textContent=`${midpoint>=20?'TAKE':'SKIP'} · ${money(midpoint)}/hr midpoint · ${Math.round(fast)}–${Math.round(slow)} min estimated`;div.append(result);
+  }
+  const warning=document.createElement('p');warning.className='warn';warning.textContent='Drive time assumed; confirm OCR details before accepting.';div.append(warning);
+  $('cards').append(div);
+ }
+}
+$('file').addEventListener('change',()=>{const f=$('file').files[0];$('scan').disabled=!f;if(f){$('preview').src=URL.createObjectURL(f);$('preview').hidden=false;$('status').textContent='Ready to scan '+f.name;}});
+$('scan').addEventListener('click',async()=>{
+ const file=$('file').files[0];if(!file)return;
+ if(!window.Tesseract){$('status').textContent='OCR library could not load. Check internet connection.';return;}
+ $('scan').disabled=true;$('results').hidden=true;
+ let worker;
+ try{
+  $('status').textContent='Loading image recognition…';
+  worker=await Tesseract.createWorker('eng',1,{logger:m=>{if(m.status)$('status').textContent=m.status+(m.progress?' '+Math.round(m.progress*100)+'%':'');}});
+  const result=await worker.recognize(file);
+  const text=result.data.text||'';
+  $('raw').textContent=text;
+  const offers=parse(text);show(offers);
+  $('status').textContent=`Finished. ${offers.filter(x=>!x.error).length} complete offer(s) recognized. Review details below.`;
+ }catch(e){$('status').textContent='Recognition failed: '+(e?.message||String(e));}
+ finally{if(worker)await worker.terminate().catch(()=>{});$('scan').disabled=false;}
+});
+</script></body></html>
