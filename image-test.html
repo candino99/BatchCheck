@@ -100,6 +100,7 @@ const stores = [
   [/741\s+s\s+orlando/i,'Publix'],
   [/11055\s+daryl\s+carter/i,'Publix'],
   [/1500\s+(?:north|n)\s+mills/i,'The Fresh Market'],
+  [/2015\s+edgewater\s+(?:dr|drive)/i,'Publix'],
   [/2701\s+n\s+hiawassee/i,'Bravo']
 ];
 
@@ -157,69 +158,57 @@ function identifyStore(address, text) {
 }
 
 function parseOrders(text) {
-  const lines = String(text)
-    .replace(/\r/g,'\n')
-    .split('\n')
-    .map(s=>s.trim())
-    .filter(Boolean);
-
-  const starts = [];
-
-  for (let i=0;i<lines.length;i++) {
-    if (orderRe.test(lines[i])) starts.push(i);
-  }
-
-  const found = [];
-
-  for (let k=0;k<starts.length;k++) {
-    const start = starts[k];
-    const end = k+1<starts.length ? starts[k+1] : lines.length;
-
-    const section = lines.slice(start,end);
-    const order = section[0].match(orderRe);
-
-    if (!order) continue;
-
-    const items = section.find(x=>itemRe.test(x))?.match(itemRe);
-
-    const mileageLine = section.find(x=>milesRe.test(x));
-    const miles = mileageLine?.match(milesRe);
-
-    const address = (section.find(x=>
-      /\d{2,}\s+.+(?:rd|road|ave|avenue|pkwy|parkway|blvd|street|dr|drive)/i.test(x)
-    ) || '').replace(/\s+\d+(?:[.,]\d+)?\s*(?:mi|miles?)\b.*$/i,'').trim();
-
-    const count = Number(order[1]);
-    const shopOnly = /shop\s*only/i.test(order[2]) ? count : 0;
-
-    // Look for a payment immediately above this order.
-    // Do not borrow a payment from another batch.
-    const preceding = lines.slice(Math.max(0,start-3),start);
-    let pay = null;
-
-    for (let j=preceding.length-1;j>=0;j--) {
-      const candidate = getPrice(preceding[j]);
-
-      if (candidate !== null) {
-        pay = candidate;
-        break;
-      }
+  const lines = String(text).replace(/\r/g,'\n').split('\n')
+    .map(s=>s.trim()).filter(Boolean);
+  const starts=[];
+  for(let i=0;i<lines.length;i++) if(orderRe.test(lines[i])) starts.push(i);
+  const rows=[];
+  for(let k=0;k<starts.length;k++) {
+    const start=starts[k], end=k+1<starts.length?starts[k+1]:lines.length;
+    const section=lines.slice(start,end);
+    const order=section[0].match(orderRe);
+    if(!order)continue;
+    const items=section.find(x=>itemRe.test(x))?.match(itemRe);
+    const miles=section.find(x=>milesRe.test(x))?.match(milesRe);
+    const address=(section.find(x=>/\d{2,}\s+.+(?:rd|road|ave|avenue|pkwy|parkway|blvd|street|dr|drive)/i.test(x))||'')
+      .replace(/\s+\d+(?:[.,]\d+)?\s*(?:mi|miles?)\b.*$/i,'').trim();
+    const count=Number(order[1]);
+    const isShopOnly=/shop\s*only/i.test(order[2]);
+    const preceding=lines.slice(Math.max(0,start-3),start);
+    let pay=null;
+    for(let j=preceding.length-1;j>=0;j--){
+      const candidate=getPrice(preceding[j]);
+      if(candidate!==null){pay=candidate;break;}
     }
-
-    found.push({
-      pay,
-      store:identifyStore(address,section.join(' ')),
-      items:items ? Number(items[1]) : null,
-      units:items?.[2] ? Number(items[2]) : null,
-      miles:miles ? Number(miles[1].replace(',','.')) : null,
-      deliveries:shopOnly ? 0 : count,
-      shopOnly,
-      address,
-      orderText:section[0],
-      sourceIndex:start
-    });
+    rows.push({pay,store:identifyStore(address,section.join(' ')),
+      items:items?Number(items[1]):null,units:items?.[2]?Number(items[2]):null,
+      miles:miles?Number(miles[1].replace(',','.')):null,
+      deliveries:isShopOnly?0:count,shopOnly:isShopOnly?count:0,
+      address,orderText:section[0],sourceIndex:start,
+      kind:isShopOnly?'shopOnly':'delivery'});
   }
-
+  // Instacart sometimes prints Shop & Deliver and Shop Only as two rows
+  // under one payment. Merge only adjacent complementary rows without
+  // a second payment; never merge two separately priced offers.
+  const found=[];
+  for(const row of rows){
+    const prev=found[found.length-1];
+    const compatible=prev && prev.kind!==row.kind && row.pay===null &&
+      row.sourceIndex-prev.sourceIndex<=10 &&
+      (!prev.address||!row.address||prev.address.toLowerCase()===row.address.toLowerCase()) &&
+      (prev.store==='Unknown store'||row.store==='Unknown store'||prev.store.toLowerCase()===row.store.toLowerCase());
+    if(compatible){
+      prev.items=prev.items===null||row.items===null?null:prev.items+row.items;
+      prev.units=prev.units===null||row.units===null?null:prev.units+row.units;
+      prev.deliveries+=row.deliveries;
+      prev.shopOnly+=row.shopOnly;
+      prev.miles=prev.miles??row.miles;
+      prev.address=prev.address||row.address;
+      if(prev.store==='Unknown store')prev.store=row.store;
+      prev.orderText+=' + '+row.orderText;
+      prev.kind='mixed';
+    } else found.push({...row});
+  }
   return found;
 }
 
@@ -651,7 +640,7 @@ $('scan').addEventListener('click',async()=>{
     const seen=new Set();return found.filter(valid).filter(p=>p.distance<=16.2).sort((a,b)=>a.distance-b.distance).filter(p=>{const key=p.lat.toFixed(4)+','+p.lon.toFixed(4);if(seen.has(key))return false;seen.add(key);return true;}).slice(0,20);
   }
   async function road(place,loc){const data=await fetchJson('https://router.project-osrm.org/route/v1/driving/'+loc.lon+','+loc.lat+';'+place.lon+','+place.lat+'?overview=false',{},11000);if(data.code!=='Ok'||!data.routes?.length)throw Error('No road route found');return {minutes:Math.ceil(data.routes[0].duration/60),miles:data.routes[0].distance/1609.344};}
-  function estimate(b,drive,brand){const m=mult(brand),fast=drive+b.items*40/60*m+(b.items?10:0)+b.shopOnly*5+b.miles*2+b.deliveries*5,slow=drive+b.items*55/60*m+(b.items?20:0)+b.shopOnly*5+b.miles*4+b.deliveries*10;const low=b.pay*60/slow,high=b.pay*60/fast;return {fast,slow,low,high,mid:(low+high)/2};}
+  function estimate(b,drive,brand){const m=mult(brand),fast=drive+b.items*40/60*m+(b.items?10:0)+b.shopOnly*5+b.miles*2+b.deliveries*2,slow=drive+b.items*70/60*m+(b.items?25:0)+b.shopOnly*10+b.miles*4+b.deliveries*8+5;const low=b.pay*60/slow,high=b.pay*60/fast;return {fast,slow,low,high,mid:(low+high)/2};}
   show=function(offers){
     latest=offers;const run=++generation,cards=$id('cards');$id('results').hidden=false;cards.replaceChildren();
     if(!offers.length){node(cards,'p','No batches recognized. See extracted text.','warn');return;}
