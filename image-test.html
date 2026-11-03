@@ -579,6 +579,478 @@ $('scan').addEventListener('click',async()=>{
   }
 });
 </script>
+  
+<script>
+"use strict";
+
+/* BatchCheck GPS-integrated screenshot results.
+   Preserves the existing OCR and payment scanner. */
+
+(() => {
+  const brands = [
+    "Publix", "The Fresh Market", "Walgreens",
+    "Bravo", "Aldi", "Sprouts", "Costco",
+    "Sam's Club", "Target", "H Mart",
+    "Walmart", "Winn-Dixie", "Whole Foods"
+  ];
+
+  let currentLocation = null;
+  const cache = new Map();
+
+  const style = document.createElement("style");
+  style.textContent = `
+    #preview {
+      width:auto; max-width:100%; height:115px;
+      object-fit:contain; display:block; margin:10px auto;
+    }
+    #preview[hidden] { display:none; }
+    .gps-card {
+      padding:15px; margin:12px 0;
+      background:#0d1a30; border:1px solid #405471;
+      border-radius:13px;
+    }
+    .gps-card select, .gps-card button {
+      width:100%; margin:7px 0; min-height:48px;
+      font-size:16px;
+    }
+    .gps-card select {
+      background:#182842; color:white;
+      border:1px solid #60718d; border-radius:9px;
+      padding:10px;
+    }
+    .gps-card button { background:#63daa1; color:#092519; }
+    .gps-result {
+      font-size:20px; font-weight:800;
+      line-height:1.5; margin-top:12px;
+    }
+    .gps-note { font-size:13px; color:#ffcc80; }
+  `;
+  document.head.append(style);
+
+  const gpsStatus = document.createElement("p");
+  gpsStatus.className = "muted small";
+  gpsStatus.textContent = "📍 Connecting to phone GPS...";
+
+  const fileInput = document.getElementById("file");
+  fileInput?.parentElement?.insertBefore(
+    gpsStatus, fileInput
+  );
+
+  if (navigator.geolocation) {
+    navigator.geolocation.watchPosition(
+      position => {
+        currentLocation = {
+          lat: position.coords.latitude,
+          lon: position.coords.longitude,
+          accuracy: position.coords.accuracy,
+          time: position.timestamp
+        };
+        gpsStatus.textContent =
+          "📍 GPS connected · accuracy approximately " +
+          Math.round(currentLocation.accuracy) + " m";
+      },
+      error => {
+        currentLocation = null;
+        gpsStatus.textContent =
+          "⚠ GPS unavailable: " + error.message;
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 5000,
+        timeout: 20000
+      }
+    );
+  } else {
+    gpsStatus.textContent = "GPS not supported.";
+  }
+
+  function text(parent, tag, value, cls) {
+    const el = document.createElement(tag);
+    el.textContent = value;
+    if (cls) el.className = cls;
+    parent.append(el);
+    return el;
+  }
+
+  function distanceMiles(a, b, c, d) {
+    const rad = x => x * Math.PI / 180;
+    const deltaLat = rad(c - a);
+    const deltaLon = rad(d - b);
+    const h =
+      Math.sin(deltaLat / 2) ** 2 +
+      Math.cos(rad(a)) * Math.cos(rad(c)) *
+      Math.sin(deltaLon / 2) ** 2;
+    return 3958.8 * 2 * Math.asin(
+      Math.min(1, Math.sqrt(h))
+    );
+  }
+
+  async function findBranches(brand, loc) {
+    const key = brand + ":" +
+      loc.lat.toFixed(2) + ":" + loc.lon.toFixed(2);
+
+    if (cache.has(key)) return cache.get(key);
+
+    const radius = 0.35;
+    const box = [
+      loc.lon - radius,
+      loc.lat + radius,
+      loc.lon + radius,
+      loc.lat - radius
+    ].join(",");
+
+    const url =
+      "https://nominatim.openstreetmap.org/search" +
+      "?format=json&addressdetails=1&limit=30" +
+      "&viewbox=" + encodeURIComponent(box) +
+      "&bounded=1&q=" + encodeURIComponent(brand);
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error("Store search unavailable.");
+    }
+
+    const data = await response.json();
+
+    const branches = data
+      .map(place => ({
+        name: place.display_name,
+        lat: Number(place.lat),
+        lon: Number(place.lon)
+      }))
+      .filter(place =>
+        Number.isFinite(place.lat) &&
+        Number.isFinite(place.lon)
+      )
+      .map(place => ({
+        ...place,
+        distance: distanceMiles(
+          loc.lat, loc.lon,
+          place.lat, place.lon
+        )
+      }))
+      .filter(place => place.distance <= 25)
+      .sort((a, b) => a.distance - b.distance);
+
+    cache.set(key, branches);
+    return branches;
+  }
+
+  async function drivingRoute(destination, loc) {
+    const url =
+      "https://router.project-osrm.org/route/v1/driving/" +
+      loc.lon + "," + loc.lat + ";" +
+      destination.lon + "," + destination.lat +
+      "?overview=false";
+
+    const response = await fetch(url);
+
+    if (!response.ok) {
+      throw new Error("Road routing unavailable.");
+    }
+
+    const data = await response.json();
+
+    if (data.code !== "Ok" || !data.routes?.length) {
+      throw new Error("No road route found.");
+    }
+
+    return {
+      minutes: Math.ceil(data.routes[0].duration / 60),
+      miles: data.routes[0].distance / 1609.344
+    };
+  }
+
+  function calculate(batch, drive) {
+    const multiplier = mult(batch.store);
+
+    const fast =
+      drive +
+      batch.items * 40 / 60 * multiplier +
+      (batch.items ? 10 : 0) +
+      batch.shopOnly * 5 +
+      batch.miles * 2 +
+      batch.deliveries * 5;
+
+    const slow =
+      drive +
+      batch.items * 55 / 60 * multiplier +
+      (batch.items ? 20 : 0) +
+      batch.shopOnly * 5 +
+      batch.miles * 4 +
+      batch.deliveries * 10;
+
+    if (fast <= 0 || slow <= 0) return null;
+
+    const low = batch.pay * 60 / slow;
+    const high = batch.pay * 60 / fast;
+
+    return {
+      fast, slow, low, high,
+      midpoint: (low + high) / 2
+    };
+  }
+
+  // Replace only the display logic.
+  // The original screenshot recognition remains untouched.
+  show = function(offers) {
+    const results = document.getElementById("results");
+    const cards = document.getElementById("cards");
+
+    results.hidden = false;
+    cards.replaceChildren();
+
+    if (!offers.length) {
+      text(cards, "p",
+        "No batches recognized. Check extracted text.",
+        "warn");
+      return;
+    }
+
+    offers.forEach((batch, index) => {
+      const card = document.createElement("div");
+      card.className = "offer";
+
+      text(card, "h3",
+        "Batch " + (index + 1) + " · " +
+        (batch.pay === null
+          ? "Payment missing"
+          : money(batch.pay)));
+
+      text(card, "p",
+        (batch.items ?? "?") + " items · " +
+        batch.deliveries + " deliveries · " +
+        batch.shopOnly + " Shop Only · " +
+        (batch.miles ?? "?") + " miles");
+
+      if (batch.address) {
+        text(card, "p",
+          "Screenshot address (NOT verified pickup): " +
+          batch.address, "muted small");
+      }
+
+      const missing = [];
+      if (batch.pay === null) missing.push("payment");
+      if (batch.items === null) missing.push("items");
+      if (batch.miles === null) missing.push("mileage");
+
+      if (missing.length) {
+        text(card, "p",
+          "NEEDS DETAILS: Missing " + missing.join(", "),
+          "warn");
+        cards.append(card);
+        return;
+      }
+
+      const area = document.createElement("div");
+      area.className = "gps-card";
+      card.append(area);
+
+      text(area, "p",
+        "Confirm the store brand:",
+        "muted small");
+
+      const brandSelect = document.createElement("select");
+
+      const blank = document.createElement("option");
+      blank.value = "";
+      blank.textContent = "Choose store brand";
+      brandSelect.append(blank);
+
+      brands.forEach(name => {
+        const option = document.createElement("option");
+        option.value = name;
+        option.textContent = name;
+        brandSelect.append(option);
+      });
+
+      // OCR-derived brand is a hint, not a verified pickup.
+      const suggested = brands.find(name =>
+        name.toLowerCase() ===
+        String(batch.store).toLowerCase()
+      );
+
+      if (suggested) brandSelect.value = suggested;
+
+      area.append(brandSelect);
+
+      const findButton = document.createElement("button");
+      findButton.type = "button";
+      findButton.textContent = "📍 Find nearby branches";
+      area.append(findButton);
+
+      const branchSelect = document.createElement("select");
+      branchSelect.hidden = true;
+      area.append(branchSelect);
+
+      const routeButton = document.createElement("button");
+      routeButton.type = "button";
+      routeButton.textContent = "Calculate GPS drive";
+      routeButton.hidden = true;
+      area.append(routeButton);
+
+      const output = text(
+        area, "p",
+        "PROVISIONAL · Pickup branch not verified.",
+        "gps-note"
+      );
+
+      brandSelect.addEventListener("change", () => {
+        branchSelect.hidden = true;
+        routeButton.hidden = true;
+        output.textContent =
+          "PROVISIONAL · Find and select the pickup branch.";
+      });
+
+      findButton.addEventListener("click", async () => {
+        if (!currentLocation) {
+          output.textContent =
+            "GPS unavailable. Allow location access and retry.";
+          return;
+        }
+
+        if (!brandSelect.value) {
+          output.textContent =
+            "Select the store brand first.";
+          return;
+        }
+
+        findButton.disabled = true;
+        output.textContent = "Searching nearby branches...";
+
+        try {
+          const found = await findBranches(
+            brandSelect.value, currentLocation
+          );
+
+          branchSelect.replaceChildren();
+
+          if (!found.length) {
+            output.textContent =
+              "No nearby branches found. " +
+              "Store database may be incomplete. " +
+              "No TAKE/SKIP recommendation.";
+            return;
+          }
+
+          const prompt = document.createElement("option");
+          prompt.value = "";
+          prompt.textContent = "Select actual pickup branch";
+          branchSelect.append(prompt);
+
+          found.forEach((branch, i) => {
+            const option = document.createElement("option");
+            option.value = String(i);
+            option.textContent =
+              branch.name + " · " +
+              branch.distance.toFixed(1) + " mi away";
+            branchSelect.append(option);
+          });
+
+          branchSelect.hidden = false;
+          routeButton.hidden = false;
+
+          output.textContent =
+            found.length + " possible branches found. " +
+            "Select the actual Instacart pickup location.";
+
+          routeButton.onclick = async () => {
+            if (branchSelect.value === "") {
+              output.textContent =
+                "Choose the correct pickup branch.";
+              return;
+            }
+
+            const branch = found[Number(branchSelect.value)];
+            routeButton.disabled = true;
+            output.textContent = "Calculating road drive...";
+
+            try {
+              if (!currentLocation) {
+                throw new Error("GPS unavailable.");
+              }
+
+              const route = await drivingRoute(
+                branch, currentLocation
+              );
+
+              // Use confirmed brand for store multiplier.
+              const correctedBatch = {
+                ...batch,
+                store: brandSelect.value
+              };
+
+              const calc = calculate(
+                correctedBatch, route.minutes
+              );
+
+              if (!calc) {
+                throw new Error("Invalid batch calculation.");
+              }
+
+              const take = calc.midpoint >= 20;
+
+              output.className =
+                "gps-result " + (take ? "take" : "skip");
+
+              output.textContent =
+                (take ? "TAKE" : "SKIP") +
+                " · " + money(calc.midpoint) +
+                "/hr midpoint";
+
+              text(area, "p",
+                "GPS road drive: " + route.minutes +
+                " min · " + route.miles.toFixed(1) +
+                " road miles", "muted");
+
+              text(area, "p",
+                "Hourly range: " +
+                money(calc.low) + "–" +
+                money(calc.high) + "/hr · " +
+                Math.round(calc.fast) + "–" +
+                Math.round(calc.slow) + " min total",
+                "muted");
+
+              text(area, "p",
+                "Pickup selected: " + branch.name,
+                "muted small");
+
+              text(area, "p",
+                "Road estimate excludes live traffic. " +
+                "Confirm the selected branch, screenshot " +
+                "details and pickup assignment. " +
+                "Recalculate if your location changes.",
+                "gps-note");
+
+              routeButton.hidden = true;
+              branchSelect.disabled = true;
+              brandSelect.disabled = true;
+
+            } catch (error) {
+              output.className = "gps-note";
+              output.textContent =
+                "PROVISIONAL · " + error.message;
+            } finally {
+              routeButton.disabled = false;
+            }
+          };
+
+        } catch (error) {
+          output.textContent =
+            "Store search failed: " + error.message;
+        } finally {
+          findButton.disabled = false;
+        }
+      });
+
+      cards.append(card);
+    });
+  };
+})();
+</script>
+
+
 </body>
 </html>
 
